@@ -2,7 +2,7 @@
 
 > **TypeScript (strict)** · Node.js ≥ 22.13 · MCP SDK · Express · zod 4 · SQLite (`node:sqlite`) · Anthropic SDK
 
-Four modules covering an AI gateway stack: an MCP server, an MCP security gateway, a streaming PII guardrail, and a rate-limited LLM router with provider failover. Every behaviour described below is covered by an automated test (**76 tests**, `npm test`) and by the end-to-end demo (`npm run demo`, 21 checks). Neither needs API keys.
+Four modules covering an AI gateway stack: an MCP server, an MCP security gateway, a streaming PII guardrail, and a rate-limited LLM router with provider failover. Every behaviour described below is covered by an automated test (**91 tests**, `npm test`) and by the end-to-end demo (`npm run demo`, 21 checks). Neither needs API keys.
 
 ---
 
@@ -33,7 +33,7 @@ Four modules covering an AI gateway stack: an MCP server, an MCP security gatewa
 
 ```bash
 npm install
-npm test                  # build + 76 tests (node:test)
+npm test                  # build + 91 tests (node:test)
 npm run demo              # in-process end-to-end demo, prints ✅/❌, exits non-zero on failure
 
 cp .env.example .env      # then fill in what you need (see below)
@@ -57,21 +57,26 @@ All `npm run taskN` scripts load `.env` automatically (`node --env-file-if-exist
 | Tool | Input | Rules |
 |------|-------|-------|
 | `get_customer_record` | `customer_id` | `^CUST-\d{5}$` |
-| `trigger_refund` | `customer_id`, `amount`, `reason` | amount finite, > 0, ≤ 10 000, ≤ 2 decimals; reason trimmed, 10–500 chars |
+| `trigger_refund` | `customer_id`, `amount`, `reason` | amount finite, > 0, ≤ 10 000, ≤ 2 decimals; reason ≥ 10 non-whitespace chars, ≤ 500 |
 
 - **Schemas are strict.** Unknown fields such as `"approved_by": "admin"` are rejected.
-- **`1e400` is rejected.** `JSON.parse` turns it into `Infinity`, so non-finite amounts get an explicit error.
-- **Padding doesn't count.** Whitespace is trimmed before the minimum-length check.
+- **`1e400` is rejected.** `JSON.parse` turns it into `Infinity`, so non-finite amounts get an explicit error. NaN can't be written in JSON at all, so it arrives as a parse error.
+- **Spaces don't count.** The reason needs 10 non-whitespace characters, so `"          "` and `"a         b"` are both rejected.
 - **Real JSON-RPC errors.** `McpServer` from the SDK turns every handler error, including its own zod failures, into `result.isError`. This server uses the lower-level `Server` instead and throws `McpError(InvalidParams)`, so the client gets error **`-32602`**:
   - invalid arguments → `-32602`
   - unknown tool → `-32602`
   - handler crash → `-32603`, with nothing internal leaked
   - business failures, such as a suspended customer → a normal `isError` result
-- **Clean stdout.** Only JSON-RPC frames go to stdout; all logging goes to stderr. A test checks every stdout line.
+  - invalid JSON → `-32700`; JSON that isn't JSON-RPC → `-32600` (the SDK alone sends no reply at all)
+- **Machine-readable errors.** `error.data.issues` lists `{ field, message }` for every problem. Submitted values are never echoed or logged.
+- **Clean stdout.** Only JSON-RPC frames go to stdout; all logging goes to stderr. A stray `console.log` (even from a dependency) is redirected to stderr too. A test checks every stdout line.
+- **Startup and shutdown.**
+  - Startup failures, uncaught exceptions and unhandled rejections are logged to stderr and exit with code 1.
+  - SIGINT, SIGTERM and stdin closing shut the server down cleanly with code 0.
 
 ```jsonc
-→ {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_customer_record","arguments":{"customer_id":"INVALID"}}}
-← {"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"MCP error -32602: Invalid params: customer_id: customer_id must match format CUST-XXXXX (e.g. CUST-00123)"}}
+→ {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer_record","arguments":{"customer_id":"INVALID"}}}
+← {"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"MCP error -32602: Invalid params: customer_id: must match format CUST-XXXXX (exactly five digits, e.g. CUST-00123)","data":{"issues":[{"field":"customer_id","message":"must match format CUST-XXXXX (exactly five digits, e.g. CUST-00123)"}]}}}
 ```
 
 ---
@@ -219,7 +224,7 @@ curl -s localhost:3004/v1/chat/completions -H "Authorization: Bearer $TENANT_KEY
 
 | Suite | Tests | Highlights |
 |-------|------:|------------|
-| `task1.test.ts` | 15 | Schema edge cases; spawns the real stdio server: raw `1e400`, `-32602` vs `isError`, stdout purity |
+| `task1.test.ts` | 30 | Every validation case (valid/invalid ID, negative, zero, NaN, Infinity, empty or space-only reason, missing and unexpected fields, valid refund) as schema tests and over the real stdio server; the exact `-32602` response; `-32700`/`-32600`; stdout purity; startup failure → exit 1; stdin close → exit 0 |
 | `task2.test.ts` | 21 | Forged, `alg:none`, tampered, expired, wrong-aud/iss tokens; `ADMIN_` in any casing; invalid JSON-RPC; ID preservation; timeouts/502; audit logs with no secrets; stdio bridge to Task 1 with concurrent same-ID requests |
 | `task3.test.ts` | 22 | SSE parser at every split point; redactor ≡ `redact(full)` at every split, char-by-char and under fuzz; byte-sliced end-to-end; single `[DONE]`; malformed frames; missing `[DONE]`; client disconnect cancels upstream; TTFT; no PII in logs |
 | `task4.test.ts` | 18 | Exact 429 + Retry-After; oversized → 400; 25 concurrent requests and 4 processes on one DB with no over-allocation; persistence across restarts; reconciliation; every failover path; Anthropic request translation; tenant isolation; `/metrics` auth; no keys in logs |
