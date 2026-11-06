@@ -1,104 +1,175 @@
-# QuilrAI Technical Assessment
+# QuilrAI — AI Infrastructure Assessment
 
-Four production-grade TypeScript modules covering MCP servers, security gateways, LLM streaming guardrails, and rate-limiting routers.
+> **TypeScript** · MCP SDK · Node.js 24 · Express · SQLite (built-in)
 
-## Setup
+Four production-grade modules covering the full AI gateway stack: MCP servers, security proxies, streaming guardrails, and resilient LLM routing.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│  AI Agent   │────▶│  Task 2: MCP Gateway │────▶│ Downstream MCP  │
+└─────────────┘     │  (auth + filtering)  │     │ (Task 1 server) │
+                    └──────────────────────┘     └─────────────────┘
+
+┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│   Client    │────▶│ Task 3: LLM Guardrail│────▶│  LLM Provider   │
+└─────────────┘     │  (PII redaction)     │     └─────────────────┘
+
+┌─────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│   Client    │────▶│ Task 4: Rate Limiter │────▶│ Primary / Fallback│
+└─────────────┘     │  (SQLite + failover) │     └─────────────────┘
+```
+
+---
+
+## Quick Start
 
 ```bash
 npm install
 npm run build
+
+# Run any task
+npm run task1   # MCP server (stdio)
+npm run task2   # MCP gateway  (port 3002)
+npm run task3   # LLM guardrail (port 3003)
+npm run task4   # Rate-limit router (port 3004)
 ```
+
+Copy `.env.example` to `.env` and fill in your API keys before running Tasks 3 & 4.
 
 ---
 
 ## Task 1 — Custom MCP Server with Strict Validation
 
-Exposes two tools over `stdio` transport using the official `@modelcontextprotocol/sdk`:
+**File:** `src/task1-mcp-server/index.ts`
 
-| Tool | Inputs | Validation |
-|------|--------|------------|
+Exposes two tools over `stdio` transport using `@modelcontextprotocol/sdk`:
+
+| Tool | Input | Validation |
+|------|-------|------------|
 | `get_customer_record` | `customer_id: string` | Must match `CUST-XXXXX` (Zod regex) |
 | `trigger_refund` | `customer_id`, `amount: float`, `reason: string` | amount > 0, reason ≥ 10 chars |
 
-**STDIO isolation:** all debug logs go to `stderr`; `stdout` carries only JSON-RPC messages.
+**STDIO isolation:** `stdout` carries only JSON-RPC — all debug output goes to `stderr`.
 
-```bash
-npm run task1
-# or pipe MCP messages directly:
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | npm run task1
+**Example — valid call:**
+```jsonc
+// stdin →
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_customer_record","arguments":{"customer_id":"CUST-00123"}}}
+
+// stdout ←
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\n  \"customer_id\": \"CUST-00123\", ...}"}]}}
+```
+
+**Example — invalid format (Zod rejection):**
+```jsonc
+// stdin →
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_customer_record","arguments":{"customer_id":"INVALID"}}}
+
+// stdout ←
+{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Invalid params: customer_id must match format CUST-XXXXX"}}
 ```
 
 ---
 
 ## Task 2 — MCP Security Gateway Proxy
 
-HTTP reverse proxy sitting between an AI agent and a downstream MCP server.
+**File:** `src/task2-mcp-gateway/index.ts`
 
-**Auth:** Bearer token decoded from base64 (`role:admin` or `role:viewer`).
+HTTP reverse proxy with role-based tool authorization.
 
-| Method | Behaviour |
-|--------|-----------|
-| `tools/list` | Forwarded transparently |
-| `tools/call` with `params.name` starting `admin_` | Requires `admin` role; returns `-32001 Unauthorized Tool Call` otherwise |
-| All others | Forwarded transparently |
-
+**Token format:** Base64-encode `role:admin` or `role:viewer`
 ```bash
-DOWNSTREAM_URL=http://localhost:3001 npm run task2
+echo -n "role:admin"  | base64  # → cm9sZTphZG1pbg==
+echo -n "role:viewer" | base64  # → cm9sZTp2aWV3ZXI=
+```
 
-# Admin token: base64("role:admin") = "cm9sZTphZG1pbg=="
-# Viewer token: base64("role:viewer") = "cm9sZTp2aWV3ZXI="
+**Authorization matrix:**
 
+| Method | Tool name | Role | Result |
+|--------|-----------|------|--------|
+| `tools/list` | — | any | Forwarded |
+| `tools/call` | `get_data` | any | Forwarded |
+| `tools/call` | `admin_reset_key` | viewer | ❌ `-32001 Unauthorized` |
+| `tools/call` | `admin_reset_key` | admin | ✅ Forwarded |
+
+**Example — blocked call:**
+```bash
 curl -X POST http://localhost:3002 \
   -H "Authorization: Bearer cm9sZTp2aWV3ZXI=" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"admin_reset_key"}}'
-# → -32001 Unauthorized Tool Call
+
+# Response:
+{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Unauthorized Tool Call"}}
 ```
 
 ---
 
 ## Task 3 — LLM Gateway Streaming Guardrail (PII Redaction)
 
-Proxies OpenAI-compatible streaming completions and redacts PII in real time.
+**File:** `src/task3-llm-guardrail/index.ts`
+
+Proxies OpenAI-compatible streaming completions with real-time PII redaction.
 
 **Redacted patterns:**
-- Email addresses
-- SSNs (`XXX-XX-XXXX`)
-- Credit card numbers (13–16 digits)
-- Phone numbers
+| Pattern | Example input | Output |
+|---------|--------------|--------|
+| Email | `jane@example.com` | `[REDACTED]` |
+| SSN | `123-45-6789` | `[REDACTED]` |
+| Credit card | `4111 1111 1111 1111` | `[REDACTED]` |
+| Phone | `+1 (555) 867-5309` | `[REDACTED]` |
 
-**Design:** 64-character overlap buffer catches patterns that span chunk boundaries without buffering the full response — minimizing TTFT.
+**Design — cross-chunk safety:**
+Uses a 64-character overlap buffer so patterns split across SSE chunk boundaries are still caught without buffering the entire response in memory. Minimizes Time To First Token (TTFT).
 
 ```bash
-LLM_BASE_URL=https://api.openai.com LLM_API_KEY=sk-... npm run task3
-
 curl -X POST http://localhost:3003/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My email is test@example.com and SSN is 123-45-6789"}]}'
-# → Streams back with [REDACTED] in place of PII
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"My SSN is 123-45-6789 and email is test@corp.com"}]}'
+# Streams back: "My SSN is [REDACTED] and email is [REDACTED]"
 ```
 
 ---
 
 ## Task 4 — Rate-Limiting & Model Fallback Router
 
+**File:** `src/task4-rate-limiter/index.ts`
+
 Resilient LLM gateway with sliding-window token rate limiting and automatic failover.
 
-**Rate limiter:** token-aware sliding window (default 50,000 tokens/min per tenant API key), persisted in SQLite on disk.
+**Rate limiting:**
+- Sliding window: 50,000 tokens/min per tenant (configurable via `MAX_TOKENS_PER_MINUTE`)
+- Token usage persisted in SQLite on disk (`node:sqlite` — Node 24 built-in, zero native deps)
+- Expired rows evicted on every write
 
-**Failover:** if primary returns `429` or times out after 3,000 ms, automatically retries on secondary provider. Response includes `X-Gateway-Fallback: true` header when fallback was used.
+**Failover logic:**
+```
+Request → Primary LLM
+            ├── 429 or timeout (3s) → Secondary LLM
+            │                           ├── success → respond + X-Gateway-Fallback: true
+            │                           └── fail    → 502 sanitized error
+            └── success → respond
+```
 
-**Error sanitization:** upstream stack traces are never leaked; all errors return standardized `{ error: { code, message, source } }` payloads.
+**Error sanitization:** upstream stack traces are never exposed. All errors return:
+```json
+{ "error": { "code": 429, "message": "Rate limit exceeded: 50000 tokens/min", "source": "llm-gateway" } }
+```
 
+**Example — rate limit hit:**
 ```bash
-PRIMARY_LLM_URL=https://api.openai.com/v1/chat/completions \
-SECONDARY_LLM_URL=https://api.anthropic.com/v1/messages \
-LLM_API_KEY=sk-... npm run task4
-
 curl -X POST http://localhost:3004/v1/chat/completions \
   -H "X-Tenant-Key: tenant-abc" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+
+# After limit exceeded:
+# HTTP 429  Retry-After: 60
+# {"error":{"code":429,"message":"Rate limit exceeded: 50000 tokens/min","source":"llm-gateway"}}
 ```
 
 ---
@@ -106,9 +177,23 @@ curl -X POST http://localhost:3004/v1/chat/completions \
 ## Project Structure
 
 ```
-src/
-├── task1-mcp-server/     # MCP server with Zod validation + stdio transport
-├── task2-mcp-gateway/    # HTTP reverse proxy with role-based tool authorization
-├── task3-llm-guardrail/  # Streaming LLM proxy with real-time PII redaction
-└── task4-rate-limiter/   # Sliding window rate limiter + model fallback router
+quilr-ai-assessment/
+├── src/
+│   ├── task1-mcp-server/     # MCP server — Zod validation, stdio transport
+│   ├── task2-mcp-gateway/    # HTTP proxy — role-based tool authorization
+│   ├── task3-llm-guardrail/  # Streaming proxy — real-time PII redaction
+│   └── task4-rate-limiter/   # LLM router — sliding window + failover
+├── .env.example
+├── package.json
+└── tsconfig.json
 ```
+
+## Tech Stack
+
+| Concern | Choice | Reason |
+|---------|--------|--------|
+| MCP SDK | `@modelcontextprotocol/sdk` | Official SDK, stdio transport |
+| Validation | `zod` | Type-safe schema enforcement |
+| HTTP server | `express` | Minimal, well-understood |
+| SQLite | `node:sqlite` (built-in) | Zero native deps, Node 24+ |
+| Language | TypeScript (strict) | Type safety across all modules |
