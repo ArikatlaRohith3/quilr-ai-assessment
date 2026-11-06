@@ -4,6 +4,16 @@
 
 Four modules covering an AI gateway stack: an MCP server, an MCP security gateway, a streaming PII guardrail, and a rate-limited LLM router with provider failover. Every behaviour described below is covered by an automated test (**91 tests**, `npm test`) and by the end-to-end demo (`npm run demo`, 21 checks). Neither needs API keys.
 
+> **Changes from v1.** Every design flagged in review has been replaced in the code, not only in the docs:
+>
+> | v1 (removed) | v2 (current) |
+> |---|---|
+> | Task 2: unsigned base64 `role:admin` token | HS256-signed JWT with `exp` / `iss` / `aud` / role checks |
+> | Task 3: fixed 64-character overlap buffer | Incremental SSE parser + bounded "safe cut" redactor: output equals `redact(full text)` for any chunking |
+> | Task 4: `X-Tenant-Key` header trusted as-is | `Authorization: Bearer <tenant API key>`, checked against SHA-256 digests |
+>
+> The demo and the tests send v1-style requests on purpose (a forged base64 token, a bare `X-Tenant-Key`) and check that they are **rejected with 401**.
+
 ---
 
 ## Architecture
@@ -85,7 +95,7 @@ All `npm run taskN` scripts load `.env` automatically (`node --env-file-if-exist
 
 `src/task2-mcp-gateway/` (`auth.ts`, `authorization.ts`, `proxy.ts`, `index.ts`, `mint-token.ts`)
 
-**Authentication: signed JWTs.** The old base64 `role:admin` token could be forged by anyone and is now rejected with 401. A token is accepted only if all of these hold:
+**Authentication: signed JWTs.** A token is accepted only if all of these hold:
 - the algorithm is `HS256` (`alg: none` and other algorithms are rejected)
 - the signature matches, checked with a constant-time compare
 - `exp` is present and in the future
@@ -148,7 +158,7 @@ The guardrail proxies OpenAI-compatible `/v1/chat/completions` and redacts PII i
 
 Frames that aren't valid JSON are dropped rather than passed through unredacted.
 
-**Redaction across chunk boundaries: the "safe cut".** The old fixed 64-character overlap could leak PII that was longer or split in an unlucky place. The `StreamRedactor` instead keeps a buffer and releases text only up to a **safe cut**. A safe cut is a position where no PII match could continue across the boundary:
+**Redaction across chunk boundaries: the "safe cut".** The `StreamRedactor` keeps a buffer and releases text only up to a **safe cut**. A safe cut is a position where no PII match could continue across the boundary:
 - It is a character that can't be part of PII, so not `[A-Za-z0-9._%+\-@()]`.
 - It is not whitespace that could join two parts of a phone or card number.
 
@@ -173,7 +183,7 @@ Measured in tests: TTFT is under 500 ms, and memory stays bounded on unbroken 50
 
 `src/task4-rate-limiter/` (`database.ts`, `rate-limiter.ts`, `token-estimator.ts`, `tenants.ts`, `providers/`, `router.ts`, `index.ts`)
 
-**Tenant authentication.** Tenants send `Authorization: Bearer <key>`. Keys come from `TENANT_API_KEYS="tenantA:key,tenantB:key"` and must be at least 16 characters. Only SHA-256 digests are kept in memory. There's no default tenant, and a bare `X-Tenant-Key` header no longer grants access.
+**Tenant authentication.** Tenants send `Authorization: Bearer <key>`. Keys come from `TENANT_API_KEYS="tenantA:key,tenantB:key"` and must be at least 16 characters. Only SHA-256 digests are kept in memory. Requests without a valid key get 401; there is no default tenant.
 
 **Atomic sliding window.** The limit is `MAX_TOKENS_PER_MINUTE` (default 50 000) per tenant, persisted in SQLite (WAL, `busy_timeout`).
 1. **Estimate** the request's tokens: input plus `max_tokens`, or `DEFAULT_OUTPUT_RESERVATION` if not set. It uses `gpt-tokenizer` if that package is installed, otherwise a chars/4 heuristic, plus per-message overhead.
