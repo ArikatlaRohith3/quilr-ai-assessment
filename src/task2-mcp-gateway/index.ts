@@ -20,11 +20,11 @@ function extractRole(authHeader: string | undefined): string | null {
   }
 }
 
-// Forward request to downstream MCP server
-async function forwardToDownstream(body: unknown): Promise<{ status: number; data: unknown }> {
+// Forward request to downstream MCP server, propagating the trace ID
+async function forwardToDownstream(body: unknown, requestId: string): Promise<{ status: number; data: unknown }> {
   const res = await fetch(DOWNSTREAM_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Request-ID": requestId },
     body: JSON.stringify(body),
   });
   const data = await res.json();
@@ -41,6 +41,10 @@ app.get("/health", (_req, res) => res.json({ status: "ok", service: "mcp-gateway
 app.post("/", async (req: Request, res: Response) => {
   const body = req.body as { jsonrpc?: string; method?: string; params?: { name?: string }; id?: unknown };
 
+  // Generate or inherit a trace ID for every request
+  const requestId = (req.headers["x-request-id"] as string) || crypto.randomUUID();
+  res.setHeader("X-Request-ID", requestId);
+
   // Validate JSON-RPC envelope
   if (body.jsonrpc !== "2.0" || !body.method) {
     res.status(400).json(jsonRpcError(body.id ?? null, -32600, "Invalid JSON-RPC request"));
@@ -50,12 +54,12 @@ app.post("/", async (req: Request, res: Response) => {
   const method = body.method;
   const role = extractRole(req.headers.authorization);
 
-  console.log(`[gateway] method=${method} role=${role ?? "none"}`);
+  console.log(`[gateway] reqId=${requestId} method=${method} role=${role ?? "none"}`);
 
   // tools/list — forward transparently (no auth required)
   if (method === "tools/list") {
     try {
-      const { status, data } = await forwardToDownstream(body);
+      const { status, data } = await forwardToDownstream(body, requestId);
       res.status(status).json(data);
     } catch {
       res.status(502).json(jsonRpcError(body.id, -32603, "Downstream unreachable"));
@@ -69,7 +73,7 @@ app.post("/", async (req: Request, res: Response) => {
 
     if (toolName.startsWith("admin_")) {
       if (role !== "admin") {
-        console.log(`[gateway] AUDIT BLOCKED  tool="${toolName}" role="${role ?? "none"}"`);
+        console.log(`[gateway] AUDIT BLOCKED  reqId=${requestId} tool="${toolName}" role="${role ?? "none"}"`);
         res.status(403).json(jsonRpcError(body.id, -32001, "Unauthorized Tool Call"));
         return;
       }
@@ -77,8 +81,8 @@ app.post("/", async (req: Request, res: Response) => {
 
     // Authorized — forward to downstream
     try {
-      const { status, data } = await forwardToDownstream(body);
-      console.log(`[gateway] AUDIT ALLOWED  tool="${toolName}" role="${role ?? "none"}" upstream=${status}`);
+      const { status, data } = await forwardToDownstream(body, requestId);
+      console.log(`[gateway] AUDIT ALLOWED  reqId=${requestId} tool="${toolName}" role="${role ?? "none"}" upstream=${status}`);
       res.status(status).json(data);
     } catch {
       res.status(502).json(jsonRpcError(body.id, -32603, "Downstream unreachable"));
@@ -88,7 +92,7 @@ app.post("/", async (req: Request, res: Response) => {
 
   // All other methods — forward transparently
   try {
-    const { status, data } = await forwardToDownstream(body);
+    const { status, data } = await forwardToDownstream(body, requestId);
     res.status(status).json(data);
   } catch {
     res.status(502).json(jsonRpcError(body.id, -32603, "Downstream unreachable"));

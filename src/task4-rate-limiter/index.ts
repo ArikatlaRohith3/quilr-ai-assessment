@@ -75,6 +75,24 @@ async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Pro
 
 app.get("/health", (_req, res) => res.json({ status: "ok", service: "rate-limiter" }));
 
+// /metrics — per-tenant token usage for the current sliding window
+app.get("/metrics", (_req, res) => {
+  const cutoff = Date.now() - WINDOW_MS;
+  const rows = db.prepare(
+    "SELECT tenant_key, COALESCE(SUM(token_count), 0) AS used FROM token_usage WHERE used_at > ? GROUP BY tenant_key"
+  ).all(cutoff) as Array<{ tenant_key: string; used: number }>;
+
+  const tenants = rows.map(r => ({
+    tenant: r.tenant_key,
+    tokens_used: r.used,
+    tokens_remaining: Math.max(0, MAX_TOKENS_PER_MINUTE - r.used),
+    limit: MAX_TOKENS_PER_MINUTE,
+    window_seconds: WINDOW_MS / 1000,
+  }));
+
+  res.json({ window_start: new Date(cutoff).toISOString(), tenants });
+});
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 app.post("/v1/chat/completions", async (req: Request, res: Response) => {
   const tenantKey = (req.headers["x-tenant-key"] as string) ?? "default";
@@ -107,9 +125,11 @@ app.post("/v1/chat/completions", async (req: Request, res: Response) => {
     console.error(`[router] Primary error: ${err}`);
   }
 
-  // Failover on 429 or timeout
+  // Failover on 429 or timeout — jitter avoids thundering herd on the secondary
   if (!response || response.status === 429) {
-    console.log(`[router] Failing over — primary ${!response ? "timed out" : "returned 429"}`);
+    const jitter = Math.floor(Math.random() * 200);
+    console.log(`[router] Failing over — primary ${!response ? "timed out" : "returned 429"} (jitter=${jitter}ms)`);
+    await new Promise(r => setTimeout(r, jitter));
     usedFallback = true;
     try {
       response = await fetchWithTimeout(SECONDARY_LLM_URL, init, TIMEOUT_MS);

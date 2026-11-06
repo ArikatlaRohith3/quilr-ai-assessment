@@ -51,9 +51,19 @@ class StreamBuffer {
 
 app.get("/health", (_req, res) => res.json({ status: "ok", service: "llm-guardrail" }));
 
-// POST /v1/chat/completions — proxy with streaming PII redaction
+// POST /v1/chat/completions — proxy with bidirectional PII redaction
 app.post("/v1/chat/completions", async (req: Request, res: Response) => {
   const body = req.body as Record<string, unknown>;
+
+  // ── Inbound redaction: scrub PII from the prompt before it reaches the LLM ──
+  // Prevents sensitive data from ever leaving the client's trust boundary.
+  if (Array.isArray(body.messages)) {
+    body.messages = (body.messages as Array<{ role: string; content?: string }>).map(m => ({
+      ...m,
+      content: typeof m.content === "string" ? redact(m.content) : m.content,
+    }));
+    console.log(`[guardrail] Inbound PII redaction applied to ${(body.messages as unknown[]).length} message(s)`);
+  }
 
   // Force streaming
   body.stream = true;
