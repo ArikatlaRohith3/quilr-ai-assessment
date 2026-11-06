@@ -69,7 +69,7 @@ app.post("/", async (req: Request, res: Response) => {
 
     if (toolName.startsWith("admin_")) {
       if (role !== "admin") {
-        console.log(`[gateway] BLOCKED: tool "${toolName}" requires admin role, got "${role}"`);
+        console.log(`[gateway] AUDIT BLOCKED  tool="${toolName}" role="${role ?? "none"}"`);
         res.status(403).json(jsonRpcError(body.id, -32001, "Unauthorized Tool Call"));
         return;
       }
@@ -78,6 +78,7 @@ app.post("/", async (req: Request, res: Response) => {
     // Authorized — forward to downstream
     try {
       const { status, data } = await forwardToDownstream(body);
+      console.log(`[gateway] AUDIT ALLOWED  tool="${toolName}" role="${role ?? "none"}" upstream=${status}`);
       res.status(status).json(data);
     } catch {
       res.status(502).json(jsonRpcError(body.id, -32603, "Downstream unreachable"));

@@ -70,14 +70,15 @@ app.post("/v1/chat/completions", async (req: Request, res: Response) => {
       },
       body: JSON.stringify(body),
     });
-  } catch (err) {
-    res.status(502).json({ error: "LLM provider unreachable", detail: String(err) });
+  } catch {
+    res.status(502).json({ error: { message: "LLM provider unreachable", source: "llm-guardrail" } });
     return;
   }
 
   if (!upstream.ok || !upstream.body) {
-    const text = await upstream.text();
-    res.status(upstream.status).json({ error: "LLM provider error", detail: text });
+    res.status(upstream.status >= 500 ? 502 : upstream.status).json({
+      error: { message: `Upstream error (${upstream.status})`, source: "llm-guardrail" },
+    });
     return;
   }
 

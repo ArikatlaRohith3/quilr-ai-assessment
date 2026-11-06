@@ -31,14 +31,21 @@ Four production-grade modules covering the full AI gateway stack: MCP servers, s
 npm install
 npm run build
 
-# Run any task
-npm run task1   # MCP server (stdio)
-npm run task2   # MCP gateway  (port 3002)
-npm run task3   # LLM guardrail (port 3003)
-npm run task4   # Rate-limit router (port 3004)
+# Prove everything works in one command
+npm run demo              # starts all servers, fires real requests, prints ✅/❌
+
+# Or run tasks individually
+npm run task1             # MCP server (stdio)
+npm run task2             # MCP gateway  (port 3002)
+npm run task3             # LLM guardrail (port 3003)
+npm run task4             # Rate-limit router (port 3004)
+
+# Tests & simulations (no API key needed)
+npm run test:redaction    # 12 PII redaction unit tests
+npm run simulate          # Rate limiter burst simulation
 ```
 
-Copy `.env.example` to `.env` and fill in your API keys before running Tasks 3 & 4.
+Copy `.env.example` to `.env` and fill in your API keys before running Tasks 3 & 4 against a real LLM.
 
 ---
 
@@ -174,15 +181,39 @@ curl -X POST http://localhost:3004/v1/chat/completions \
 
 ---
 
+## Extras (Beyond the Requirements)
+
+| Extra | Command | What it shows |
+|-------|---------|---------------|
+| **End-to-end demo** | `npm run demo` | Starts all servers, fires real requests, prints ✅/❌ |
+| **PII redaction tests** | `npm run test:redaction` | 12 cases including cross-chunk boundary — no API key needed |
+| **Rate limit simulation** | `npm run simulate` | Visual burst proof: green=ok, red=429, yellow=fallback |
+| **Mock downstream** | auto-started by demo | Makes Task 2 gateway fully testable end-to-end |
+| **`/health` endpoints** | all HTTP servers | Production-ready readiness signal |
+
+---
+
 ## Project Structure
 
 ```
 quilr-ai-assessment/
 ├── src/
-│   ├── task1-mcp-server/     # MCP server — Zod validation, stdio transport
-│   ├── task2-mcp-gateway/    # HTTP proxy — role-based tool authorization
-│   ├── task3-llm-guardrail/  # Streaming proxy — real-time PII redaction
-│   └── task4-rate-limiter/   # LLM router — sliding window + failover
+│   ├── task1-mcp-server/
+│   │   └── index.ts                  # MCP server — Zod validation, stdio transport
+│   ├── task2-mcp-gateway/
+│   │   ├── index.ts                  # HTTP proxy — role-based tool authorization
+│   │   └── mock-downstream/
+│   │       └── index.ts              # Mock MCP server for end-to-end testing
+│   ├── task3-llm-guardrail/
+│   │   ├── index.ts                  # Streaming proxy — real-time PII redaction
+│   │   └── test/
+│   │       └── redaction.test.ts     # 12 PII redaction tests (no API key needed)
+│   ├── task4-rate-limiter/
+│   │   ├── index.ts                  # LLM router — sliding window + failover
+│   │   └── simulate/
+│   │       └── index.ts              # Burst simulation with color-coded output
+│   └── demo/
+│       └── index.ts                  # Unified demo — starts all servers, runs assertions
 ├── .env.example
 ├── package.json
 └── tsconfig.json
