@@ -36,6 +36,8 @@ function jsonRpcError(id: unknown, code: number, message: string) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
+app.get("/health", (_req, res) => res.json({ status: "ok", service: "mcp-gateway" }));
+
 app.post("/", async (req: Request, res: Response) => {
   const body = req.body as { jsonrpc?: string; method?: string; params?: { name?: string }; id?: unknown };
 

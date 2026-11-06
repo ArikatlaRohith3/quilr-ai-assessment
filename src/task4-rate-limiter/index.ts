@@ -73,6 +73,8 @@ async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Pro
   }
 }
 
+app.get("/health", (_req, res) => res.json({ status: "ok", service: "rate-limiter" }));
+
 // ── Route ─────────────────────────────────────────────────────────────────────
 app.post("/v1/chat/completions", async (req: Request, res: Response) => {
   const tenantKey = (req.headers["x-tenant-key"] as string) ?? "default";

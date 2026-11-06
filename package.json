@@ -9,7 +9,10 @@
     "task1": "node dist/task1-mcp-server/index.js",
     "task2": "node dist/task2-mcp-gateway/index.js",
     "task3": "node dist/task3-llm-guardrail/index.js",
-    "task4": "node dist/task4-rate-limiter/index.js"
+    "task4": "node dist/task4-rate-limiter/index.js",
+    "demo": "node dist/demo/index.js",
+    "simulate": "node dist/task4-rate-limiter/simulate/index.js",
+    "test:redaction": "node --experimental-transform-types src/task3-llm-guardrail/test/redaction.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

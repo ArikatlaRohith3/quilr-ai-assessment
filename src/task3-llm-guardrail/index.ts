@@ -49,6 +49,8 @@ class StreamBuffer {
   }
 }
 
+app.get("/health", (_req, res) => res.json({ status: "ok", service: "llm-guardrail" }));
+
 // POST /v1/chat/completions — proxy with streaming PII redaction
 app.post("/v1/chat/completions", async (req: Request, res: Response) => {
   const body = req.body as Record<string, unknown>;
