@@ -1,93 +1,71 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { TOOLS } from "./tools.js";
+import { formatZodError } from "./schemas.js";
+import { createLogger } from "../shared/logger.js";
+import { isMain } from "../shared/runtime.js";
 
-// All debug/log output goes to stderr — stdout is reserved for JSON-RPC
-const log = (...args: unknown[]) => process.stderr.write(`[mcp-server] ${args.join(" ")}\n`);
+// All logging goes to stderr — stdout is reserved for JSON-RPC frames.
+const log = createLogger("mcp-server");
 
-const server = new McpServer({
-  name: "quilr-mcp-server",
-  version: "1.0.0",
-});
+/**
+ * Why the low-level `Server` instead of `McpServer`:
+ * `McpServer` catches every error raised while handling tools/call — including its
+ * own Zod validation errors — and converts it into `result.isError: true`. The
+ * assessment requires invalid arguments to produce a JSON-RPC error with code
+ * -32602, so tools/call is handled here and validation failures are thrown as
+ * `McpError(InvalidParams)`, which the protocol layer serialises as a real error.
+ */
+export function createMcpServer(): Server {
+  const server = new Server({ name: "quilr-mcp-server", version: "2.0.0" }, { capabilities: { tools: {} } });
+  const byName = new Map(TOOLS.map((t) => [t.name, t]));
 
-// Tool 1: get_customer_record
-server.tool(
-  "get_customer_record",
-  "Retrieve a customer record by ID",
-  {
-    customer_id: z
-      .string()
-      .regex(/^CUST-\d{5}$/, "customer_id must match format CUST-XXXXX (e.g. CUST-00123)"),
-  },
-  async ({ customer_id }) => {
-    log(`get_customer_record called with customer_id=${customer_id}`);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: TOOLS.map((t) => {
+      const { $schema: _ignored, ...inputSchema } = z.toJSONSchema(t.schema, { target: "draft-7", io: "input" }) as Record<string, unknown>;
+      return { name: t.name, description: t.description, inputSchema: inputSchema as { type: "object" } };
+    }),
+  }));
 
-    // Mock customer data
-    const record = {
-      customer_id,
-      name: "Jane Doe",
-      email: "jane.doe@example.com",
-      account_status: "active",
-      created_at: "2023-01-15T10:00:00Z",
-    };
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: rawArgs } = request.params;
+    const tool = byName.get(name);
+    if (!tool) {
+      log.warn("unknown tool", { tool: name });
+      throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
+    }
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(record, null, 2),
-        },
-      ],
-    };
-  }
-);
+    const parsed = tool.schema.safeParse(rawArgs ?? {});
+    if (!parsed.success) {
+      const message = formatZodError(parsed.error);
+      log.warn("invalid arguments", { tool: name, issues: message });
+      throw new McpError(ErrorCode.InvalidParams, `Invalid params: ${message}`);
+    }
 
-// Tool 2: trigger_refund
-server.tool(
-  "trigger_refund",
-  "Trigger a refund for a customer",
-  {
-    customer_id: z
-      .string()
-      .regex(/^CUST-\d{5}$/, "customer_id must match format CUST-XXXXX"),
-    amount: z
-      .number()
-      .positive("amount must be a positive number"),
-    reason: z
-      .string()
-      .min(10, "reason must be at least 10 characters"),
-  },
-  async ({ customer_id, amount, reason }) => {
-    log(`trigger_refund called: customer_id=${customer_id}, amount=${amount}, reason="${reason}"`);
+    try {
+      return await tool.handler(parsed.data);
+    } catch (err) {
+      // Never leak internal error details (stack traces, file paths) to the client.
+      log.error("tool handler failed", { tool: name, error: String(err) });
+      throw new McpError(ErrorCode.InternalError, "Internal error while executing tool");
+    }
+  });
 
-    const refund = {
-      refund_id: `REF-${Date.now()}`,
-      customer_id,
-      amount,
-      reason,
-      status: "processed",
-      processed_at: new Date().toISOString(),
-    };
-
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(refund, null, 2),
-        },
-      ],
-    };
-  }
-);
-
-async function main() {
-  log("Starting MCP server over stdio transport...");
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  log("MCP server connected and ready.");
+  return server;
 }
 
-main().catch((err) => {
-  process.stderr.write(`[mcp-server] Fatal error: ${err}\n`);
-  process.exit(1);
-});
+async function main() {
+  log.info("starting MCP server over stdio");
+  const server = createMcpServer();
+  await server.connect(new StdioServerTransport());
+  log.info("MCP server ready");
+}
+
+if (isMain(import.meta.url)) {
+  main().catch((err) => {
+    log.error("fatal", { error: String(err) });
+    process.exit(1);
+  });
+}

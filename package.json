@@ -1,27 +1,36 @@
 {
   "name": "quilr-ai-assessment",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "QuilrAI Technical Assessment — MCP Server, Security Gateway, LLM Streaming Guardrail, Rate-Limiting Router",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
-    "build": "tsc --build",
-    "task1": "node dist/task1-mcp-server/index.js",
-    "task2": "node dist/task2-mcp-gateway/index.js",
-    "task3": "node dist/task3-llm-guardrail/index.js",
-    "task4": "node dist/task4-rate-limiter/index.js",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "task1": "node --env-file-if-exists=.env dist/task1-mcp-server/index.js",
+    "task2": "node --env-file-if-exists=.env dist/task2-mcp-gateway/index.js",
+    "task3": "node --env-file-if-exists=.env dist/task3-llm-guardrail/index.js",
+    "task4": "node --env-file-if-exists=.env dist/task4-rate-limiter/index.js",
+    "mock-downstream": "node --env-file-if-exists=.env dist/task2-mcp-gateway/mock-downstream/index.js",
+    "token": "node --env-file-if-exists=.env dist/task2-mcp-gateway/mint-token.js",
     "demo": "node dist/demo/index.js",
-    "simulate": "node dist/task4-rate-limiter/simulate/index.js",
-    "test:redaction": "node --experimental-transform-types src/task3-llm-guardrail/test/redaction.test.ts"
+    "simulate": "node --env-file-if-exists=.env dist/task4-rate-limiter/simulate/index.js",
+    "test": "npm run build && node --test --test-concurrency=1 \"dist/tests/**/*.test.js\"",
+    "test:only": "node --test --test-concurrency=1 \"dist/tests/**/*.test.js\""
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "express": "^4.21.2",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.5.4"
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3"
   }
 }
