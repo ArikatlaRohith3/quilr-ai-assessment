@@ -40,33 +40,48 @@ type Json = Record<string, unknown>;
 const STREAMED_TEXT_FIELDS = ["content", "refusal", "reasoning_content", "reasoning"] as const;
 const toolKey = (i: number) => `tool:${i}`;
 
-/** Redacts every string inside `value` (recursively), skipping the keys in `skip` at the top level. */
-function redactDeep(value: unknown, skip: ReadonlySet<string> = new Set(), depth = 0): { value: unknown; count: number } {
-  if (typeof value === "string") {
-    const r = redactWithCount(value);
-    return { value: r.text, count: r.count };
-  }
-  if (depth > 8 || value === null || typeof value !== "object") return { value, count: 0 };
+/** Sets an own property even for keys like "__proto__" (which plain assignment would treat as the prototype). */
+function setOwn(target: Json | unknown[], key: string | number, value: unknown): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * Returns a copy of `value` with every string redacted, at ANY nesting depth.
+ * Keys in `skip` are copied unchanged, but only on the top-level object.
+ *
+ * Iterative (explicit stack) rather than recursive, so there is no depth cut-off
+ * that deeply nested PII could hide behind, and no stack overflow on adversarial
+ * nesting. Inputs come from JSON.parse, so they are trees (no cycles); work is
+ * linear in their size, which the request-body and SSE-event limits bound.
+ */
+export function redactDeep(value: unknown, skip: ReadonlySet<string> = new Set()): { value: unknown; count: number } {
   let count = 0;
-  if (Array.isArray(value)) {
-    const out = value.map((v) => {
-      const r = redactDeep(v, undefined, depth + 1);
-      count += r.count;
-      return r.value;
-    });
-    return { value: out, count };
-  }
-  const out: Json = {};
-  for (const [k, v] of Object.entries(value)) {
-    if (skip.has(k)) {
-      out[k] = v;
-      continue;
-    }
-    const r = redactDeep(v, undefined, depth + 1);
+  const scrub = (s: string) => {
+    const r = redactWithCount(s);
     count += r.count;
-    out[k] = r.value;
+    return r.text;
+  };
+  if (typeof value === "string") return { value: scrub(value), count };
+  if (value === null || typeof value !== "object") return { value, count: 0 };
+
+  const emptyLike = (v: object): Json | unknown[] => (Array.isArray(v) ? [] : {});
+  const root = emptyLike(value);
+  const stack: Array<{ src: object; dst: Json | unknown[]; top: boolean }> = [{ src: value, dst: root, top: true }];
+  while (stack.length > 0) {
+    const { src, dst, top } = stack.pop()!;
+    const isArray = Array.isArray(src);
+    const entries: Array<[string | number, unknown]> = isArray ? (src as unknown[]).map((v, i) => [i, v]) : Object.entries(src);
+    for (const [key, v] of entries) {
+      if (top && !isArray && skip.has(key as string)) setOwn(dst, key, v);
+      else if (typeof v === "string") setOwn(dst, key, scrub(v));
+      else if (v !== null && typeof v === "object") {
+        const child = emptyLike(v);
+        setOwn(dst, key, child);
+        stack.push({ src: v, dst: child, top: false });
+      } else setOwn(dst, key, v);
+    }
   }
-  return { value: out, count };
+  return { value: root, count };
 }
 
 /** All streaming redactors of one choice. */

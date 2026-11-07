@@ -10,7 +10,8 @@ import { RateLimiter } from "../task4-rate-limiter/rate-limiter.js";
 import { TenantRegistry } from "../task4-rate-limiter/tenants.js";
 import { Router } from "../task4-rate-limiter/router.js";
 import { createRouterApp } from "../task4-rate-limiter/index.js";
-import { heuristicTokenizer, estimateTokens } from "../task4-rate-limiter/token-estimator.js";
+import { heuristicTokenizer, estimateTokens, loadTokenizer, TOKENIZE_CHAR_BUDGET, type Tokenizer } from "../task4-rate-limiter/token-estimator.js";
+import { countTokens } from "gpt-tokenizer";
 import { OpenAIAdapter } from "../task4-rate-limiter/providers/openai.js";
 import { AnthropicAdapter } from "../task4-rate-limiter/providers/anthropic.js";
 import { mockOpenAI, mockAnthropic, type MockLlm } from "../shared/mock-providers.js";
@@ -511,5 +512,62 @@ describe("Task 4 — rate-limiter storage failures (audit H1)", () => {
       assert.deepEqual(r.body, { error: { code: 500, message: "Internal gateway error", source: "llm-gateway" } });
       assert.equal((await fetch(`${h.running.url}/health`)).status, 200, "the server is still up");
     } finally { await h.close(); }
+  });
+});
+
+// ─────────────── tokenizer: declared dependency, bounded cost, tested fallback ───────────────
+
+describe("Task 4 — token estimation", () => {
+  const msg = (content: string) => ({ messages: [{ role: "user" as const, content }] });
+
+  test("gpt-tokenizer is a real dependency and is what the router loads by default", async () => {
+    const tok = await loadTokenizer();
+    assert.equal(tok.name, "gpt-tokenizer");
+    assert.equal(tok.maxCharsPerRequest, TOKENIZE_CHAR_BUDGET);
+    for (const text of ["Hello, world!", "Refund for order 4411: arrived damaged.", "数据保护和隐私安全".repeat(100), "🔒🙂".repeat(50)]) {
+      assert.equal(tok.count(text), countTokens(text), JSON.stringify(text.slice(0, 12)));
+    }
+  });
+
+  test("non-English text: the tokenizer counts it correctly where chars/4 badly underestimates", async () => {
+    const tok = await loadTokenizer();
+    const zh = "数据保护和隐私安全".repeat(1000);
+    const real = countTokens(zh);
+    assert.equal(estimateTokens(msg(zh), tok, 0).input, 3 + 4 + real);
+    assert.ok(heuristicTokenizer.count(zh) < real / 2, "the heuristic alone would under-reserve by more than 2x");
+  });
+
+  test("fallback: if gpt-tokenizer cannot be imported, the heuristic is used", async () => {
+    const missing = await loadTokenizer(() => Promise.reject(Object.assign(new Error("Cannot find package 'gpt-tokenizer'"), { code: "ERR_MODULE_NOT_FOUND" })));
+    assert.equal(missing, heuristicTokenizer);
+    const unusable = await loadTokenizer(async () => ({ somethingElse: true }));
+    assert.equal(unusable, heuristicTokenizer, "a module without countTokens/encode is not trusted");
+    assert.equal(estimateTokens(msg("x".repeat(400)), missing, 50).total, 3 + 4 + 100 + 50);
+  });
+
+  test("bounded cost: at most maxCharsPerRequest characters are tokenized per request, across all messages", () => {
+    let processed = 0;
+    const spy: Tokenizer = { name: "spy", maxCharsPerRequest: 1000, count: (t) => { processed += t.length; return Math.ceil(t.length / 4); } };
+    const req = { messages: [{ role: "user" as const, content: "a".repeat(700) }, { role: "assistant" as const, content: "b".repeat(700) }, { role: "user" as const, content: "数".repeat(10) }] };
+    const e = estimateTokens(req, spy, 0);
+    assert.equal(processed, 1000, "never more than the budget");
+    // 700 + 300 chars tokenized; the remaining 400 ASCII chars (400 bytes) + 10 CJK chars (30 bytes) counted as UTF-8 bytes.
+    assert.equal(e.input, 3 + 3 * 4 + 175 + 75 + 400 + 30);
+  });
+
+  test("text beyond the budget is over-estimated, never under-estimated", async () => {
+    const tok = await loadTokenizer();
+    for (const text of ["x".repeat(200_000), "The quick brown fox. ".repeat(10_000), "数据保护和隐私安全".repeat(20_000), "🔒🙂".repeat(60_000)]) {
+      const est = estimateTokens(msg(text), tok, 0).input - 7;
+      assert.ok(est >= countTokens(text), `estimate ${est} < real ${countTokens(text)} for ${JSON.stringify(text.slice(0, 8))}…`);
+    }
+  });
+
+  test("an oversized adversarial body is rejected quickly instead of tokenized for seconds", async () => {
+    const tok = await loadTokenizer();
+    const started = performance.now();
+    const e = estimateTokens(msg("x".repeat(4_000_000)), tok, 0);
+    assert.ok(e.total > 50_000, "it can never fit the default budget, so the router returns 400");
+    assert.ok(performance.now() - started < 1000, `took ${Math.round(performance.now() - started)} ms (unbounded encoding measured ~3.6 s)`);
   });
 });

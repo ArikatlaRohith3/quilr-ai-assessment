@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { SseParser, SseError } from "../task3-llm-guardrail/sse-parser.js";
 import { redact, findSafeCut, MAX_HOLDBACK } from "../task3-llm-guardrail/pii-detector.js";
 import { StreamRedactor } from "../task3-llm-guardrail/stream-redactor.js";
-import { createGuardrailApp } from "../task3-llm-guardrail/index.js";
+import { createGuardrailApp, redactDeep } from "../task3-llm-guardrail/index.js";
 import { mockSseUpstream, sseFrames, writeInSlices } from "../shared/mock-providers.js";
 import { serve, rng, sleep, captureLogs } from "./helpers.js";
 import { ApiKeyRegistry } from "../shared/api-keys.js";
@@ -383,6 +383,82 @@ describe("Task 3 — PII outside delta.content (audit C1)", () => {
       const sent = JSON.stringify(upstream.requests[0].body);
       assertNoLeak(sent);
       assert.equal(upstream.requests[0].body.messages[1].tool_calls[0].id, "call_1", "structure is preserved");
+    });
+  });
+});
+
+// ─────────────── deep nesting: no depth cut-off for redaction ───────────────
+
+/** Wraps `leaf` in `depth` levels, alternating objects and arrays. */
+function nestMixed(depth: number, leaf: unknown): unknown {
+  let v = leaf;
+  for (let i = 0; i < depth; i++) v = i % 2 === 0 ? { n: v } : [v];
+  return v;
+}
+
+describe("Task 3 — redactDeep at any depth", () => {
+  test("PII deep inside nested objects is redacted", () => {
+    for (const depth of [1, 8, 9, 10, 50, 500]) {
+      let v: unknown = `mail ${PII[0]}`;
+      for (let i = 0; i < depth; i++) v = { n: v };
+      const r = redactDeep(v);
+      assert.ok(!JSON.stringify(r.value).includes(PII[0]), `depth ${depth}`);
+      assert.match(JSON.stringify(r.value), /mail \[REDACTED\]/);
+      assert.equal(r.count, 1);
+    }
+  });
+
+  test("PII deep inside nested arrays and mixed array/object structures is redacted", () => {
+    for (const depth of [9, 64, 1000]) {
+      let arr: unknown = [`ssn ${PII[1]}`, 42, null, true];
+      for (let i = 0; i < depth; i++) arr = [arr];
+      const a = redactDeep(arr);
+      assert.ok(!JSON.stringify(a.value).includes(PII[1]), `arrays depth ${depth}`);
+      const m = redactDeep(nestMixed(depth, { card: PII[2], phone: PII[5] }));
+      for (const p of [PII[2], PII[5]]) assert.ok(!JSON.stringify(m.value).includes(p), `mixed depth ${depth}`);
+      assert.equal(m.count, 2);
+    }
+  });
+
+  test("100,000 levels of nesting: no stack overflow, PII still redacted", () => {
+    const deep = nestMixed(100_000, PII[0]);
+    const r = redactDeep(deep);
+    // nestMixed wrapped from the inside out, so the outermost layer was added last: walk back down.
+    let w: any = r.value;
+    for (let i = 100_000 - 1; i >= 0; i--) w = i % 2 === 0 ? w.n : w[0];
+    assert.equal(w, "[REDACTED]");
+    assert.equal(r.count, 1);
+  });
+
+  test("structure, non-string values and key order are preserved; skip applies only at the top level", () => {
+    const input = { keep: `top ${PII[0]}`, a: [1, 2.5, false, null, { keep: `inner ${PII[0]}` }], b: { c: "clean text" } };
+    const r = redactDeep(input, new Set(["keep"]));
+    assert.deepEqual(r.value, { keep: `top ${PII[0]}`, a: [1, 2.5, false, null, { keep: "inner [REDACTED]" }], b: { c: "clean text" } });
+    assert.deepEqual(Object.keys(r.value as object), ["keep", "a", "b"]);
+    assert.notEqual(r.value, input, "returns a copy");
+    assert.equal(input.a[4] && (input.a[4] as any).keep, `inner ${PII[0]}`, "the input is not mutated");
+  });
+
+  test('a "__proto__" key from JSON is kept as data and redacted, never treated as a prototype', () => {
+    const parsed = JSON.parse(`{"__proto__":{"x":"${PII[0]}"},"y":[{"__proto__":"${PII[1]}"}]}`);
+    const r = redactDeep(parsed);
+    const out = JSON.stringify(r.value);
+    assert.equal(out, '{"__proto__":{"x":"[REDACTED]"},"y":[{"__proto__":"[REDACTED]"}]}');
+    assert.equal(Object.getPrototypeOf(r.value), Object.prototype);
+  });
+
+  test("end-to-end: deeply nested PII is redacted inbound (to the LLM) and outbound (to the client)", async () => {
+    const deepFrame = frame({ delta: { content: "ok ", ext: nestMixed(60, `ssn ${PII[1]}`) } }, { provider_meta: nestMixed(60, [`card ${PII[2]}`]) });
+    await withGuardrail(async (res) => { res.write(deepFrame + sseFrames(["done"])); }, async (url, upstream) => {
+      const r = await collect(url, {
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hi", extra: nestMixed(60, `mail ${PII[0]}`) }], metadata: nestMixed(60, { phone: PII[5] }) },
+        ],
+      });
+      assert.equal(r.status, 200);
+      assertNoLeak(r.raw);
+      assertNoLeak(JSON.stringify(upstream.requests[0].body));
+      assert.match(r.raw, /ssn \[REDACTED\]/, "the nested outbound field is kept, just redacted");
     });
   });
 });

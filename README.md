@@ -11,7 +11,7 @@ This repository contains four services that together form a small, security-focu
 | 3 | **Streaming PII guardrail** | Proxies OpenAI-compatible streaming completions, redacting PII in requests and in the token stream | HTTP + SSE · `:3003` |
 | 4 | **Rate-limiting router** | Per-tenant token budget with atomic SQLite reservations, OpenAI → Claude failover | HTTP (JSON or SSE) · `:3004` |
 
-**Verified status (2026-11-07):** `npm ci` → `npm test` gives **122 / 122 tests passing** on Node 22 and Node 26 · `npm run demo` gives **21 / 21 checks** · `tsc --noEmit` is clean · `npm audit` reports 0 vulnerabilities. See [Testing](#testing) for the exact environment and what was *not* verified.
+**Verified status (2026-11-06):** `npm ci` → `npm test` gives **134 / 134 tests passing** on Node 22 and Node 26 · `npm run demo` gives **21 / 21 checks** · `tsc --noEmit` is clean · `npm audit` reports 0 vulnerabilities. See [Testing](#testing) for the exact environment and what was *not* verified.
 
 ---
 
@@ -87,7 +87,7 @@ Shared code lives in `src/shared/`:
 
 ```bash
 npm ci                 # reproducible install from package-lock.json
-npm test               # clean build (tsc) + all 122 tests
+npm test               # clean build (tsc) + all 134 tests
 npm run demo           # end-to-end demo of all four tasks; exits non-zero if any check fails
 ```
 
@@ -340,7 +340,7 @@ Clients send `Authorization: Bearer <client key>`. Keys come from `GUARDRAIL_API
 | Card number (13–19 digits, optional single spaces or dashes) | `4111 1111 1111 1111`, `4111-1111-1111-1111` | `[REDACTED]` |
 | Phone: North American, E.164, international with separators | `(555) 867-5309`, `+1 555 867 5309`, `+447911123456`, `+44 7911 123456`, `+91 98765-43210` | `[REDACTED]` |
 
-- **Inbound (request):** every string in every message is redacted before it leaves the trust boundary. That covers text, content parts, tool results, and tool-call arguments in the history. `logprobs` and `top_logprobs` are removed from the request.
+- **Inbound (request):** every string in every message is redacted, **at any nesting depth**, before it leaves the trust boundary. That covers text, content parts, tool results, and tool-call arguments in the history. `logprobs` and `top_logprobs` are removed from the request.
 - **Outbound (stream):** each field that carries generated text has its own streaming redactor, per choice:
   - `delta.content` and `delta.refusal`
   - `delta.reasoning_content` and `delta.reasoning`
@@ -420,7 +420,7 @@ Tenants send `Authorization: Bearer <tenant API key>`. Keys come from `TENANT_AP
 The budget is `MAX_TOKENS_PER_MINUTE` per tenant over a 60 s sliding window, persisted in SQLite (WAL mode, `busy_timeout` 5 s).
 
 1. **Validate** the request with zod: roles `system | user | assistant`, at most 500 messages, `max_tokens` ≤ 128 000. If an allowlist is configured, the requested model must be on it.
-2. **Estimate** the tokens: input (from `gpt-tokenizer` if installed, otherwise a chars/4 heuristic, plus per-message overhead) plus output (`max_tokens`, or `DEFAULT_OUTPUT_RESERVATION`). A request larger than the whole budget gets **400**.
+2. **Estimate** the tokens: input (counted with the `gpt-tokenizer` dependency, o200k_base encoding, plus per-message overhead; at most 50,000 characters per request are tokenized and any remainder is counted as UTF-8 bytes, which bounds the work and can only over-estimate; if the package can't be loaded, a chars/4 heuristic is used and `/health` reports `heuristic-4cpt`) plus output (`max_tokens`, or `DEFAULT_OUTPUT_RESERVATION`). A request larger than the whole budget gets **400**.
 3. **Reserve** atomically. Inside one `BEGIN IMMEDIATE` transaction, sum the tenant's usage over the window and insert a `reserved` row only if the request fits. Because the check and the insert are a single write transaction, concurrent requests in one process, and separate processes sharing the database file, cannot over-allocate. The tests cover 25 concurrent requests and 4 worker threads.
 4. **Cap the output.** The reserved output is **always sent to the provider as `max_tokens`**, so a reply can't be longer than its reservation, and omitting `max_tokens` can't bypass the budget.
 5. **Settle:**
@@ -522,7 +522,7 @@ Some long IDs are abbreviated with `…`.
 | Privilege escalation through tool calls | Deny-by-default method allowlist; `admin_*` and `ADMIN_ONLY_TOOLS` need `role=admin`, matched case-insensitively against a restricted tool-name charset, so lookalike or padded names can't slip past; batches rejected | `task2…/authorization.ts`, `index.ts` |
 | Tool discovery by low-privilege callers | `tools/list` filtered by role | `task2…/authorization.ts` |
 | Argument smuggling or malformed input | Strict zod schemas (unknown fields rejected), finite-number and trimmed-length rules, `-32602` errors that never echo submitted values | `task1…/schemas.ts` |
-| PII sent to or returned by an LLM | Inbound redaction of every message string; per-field outbound stream redaction with a provable chunk-boundary invariant; `logprobs` stripped; fail-closed handling of malformed frames and interrupted streams | `task3…/` |
+| PII sent to or returned by an LLM | Inbound redaction of every message string at any nesting depth (iterative walk, no depth cut-off); per-field outbound stream redaction with a provable chunk-boundary invariant; `logprobs` stripped; fail-closed handling of malformed frames and interrupted streams | `task3…/` |
 | Open proxy or credential misuse | Client keys required for Task 3 and tenant keys for Task 4, both stored as SHA-256 digests; caller keys never forwarded upstream; services refuse to start without keys | `shared/api-keys.ts` |
 | Budget exhaustion and cost abuse | Atomic reservations, output capped at the reservation, oversized requests rejected, model allowlist | `task4…/` |
 | Information leakage in errors | Upstream and downstream error bodies are never forwarded; clients get generic, sanitised messages; auth-failure reasons appear only in logs | all services |
@@ -546,11 +546,11 @@ The suites use `node:test`. They start the real services on ephemeral ports, spa
 
 ### Verified results
 
-**Environment:** 2026-11-07, Windows 11, starting from a clean `npm ci`, run on both **Node 26.12.1** (npm 11.20.0) and **Node 22.23.4** (npm 10.9.9) with identical results.
+**Environment:** 2026-11-06 (local date, US Eastern), Windows 11, starting from a clean `npm ci`, run on both **Node 26.12.1** (npm 11.20.0) and **Node 22.23.4** (npm 10.9.9) with identical results.
 
 | Command | Result |
 |---------|--------|
-| `npm test` | **122 tests, 23 suites: 122 pass, 0 fail, 0 skipped** (≈ 10 s on Node 26, ≈ 12.5 s on Node 22) |
+| `npm test` | **134 tests, 25 suites: 134 pass, 0 fail, 0 skipped** (≈ 11.2 s on Node 26, ≈ 13.5 s on Node 22) |
 | `npm run demo` | **All 21 checks passed** |
 | `npx tsc --noEmit` | No errors |
 | `npm audit` | 0 vulnerabilities |
@@ -559,8 +559,8 @@ The suites use `node:test`. They start the real services on ephemeral ports, spa
 |-------|------:|---------------------|
 | `task1.test.ts` | 31 | Valid and invalid IDs; negative, zero, NaN and ±Infinity (`1e400` on the wire) amounts; empty, whitespace-only and padded reasons, and 10-character reasons with an inner space (`"Wrong item"`) accepted; missing and unexpected fields; valid refund. Covered as schema tests and over the real stdio server, including the exact `-32602` response shape, `-32700`/`-32600` replies, stdout purity, startup failure → exit 1, uncaught exception → exit 1, and stdin close → exit 0 |
 | `task2.test.ts` | 34 | Forged base64, `alg:none`, tampered, wrong-secret, expired, wrong-`aud`/`iss`, unknown-role and missing-`exp` tokens; `admin_` in any casing; invalid envelopes; ID preservation; `X-Request-ID`; secret-free audit logs; **official MCP SDK client** (connect, list, call, `McpError -32001`, end to end to Task 1); `initialize`, 202 notifications, 405 GET/DELETE; role-filtered `tools/list`; `error.data` pass-through and size cap; hung-downstream cancel and replace; crash-loop backoff; stalled and oversized HTTP bodies |
-| `task3.test.ts` | 29 | SSE parser at every split point, byte by byte, with CRLF/CR, incomplete and oversized events; redactor ≡ `redact(full)` at every split point, char by char and under fuzz; bounded memory; byte-sliced end-to-end streams; single `[DONE]`; malformed frames dropped; missing `[DONE]`; client disconnect cancels the upstream; TTFT < 500 ms; client auth (401, upstream never called, key never forwarded); PII in tool-call arguments, `refusal` and `reasoning_content` split across frames; `logprobs` stripped; inbound tool-call history redacted; no PII in logs |
-| `task4.test.ts` | 28 | Exact 429 and `Retry-After`; storage failure → 503 with the process still serving, failed reconciliation still delivers the answer, unexpected handler error → sanitised 500; oversized → 400; 25 concurrent requests and 4 worker processes sharing one DB with no over-allocation; persistence across restarts; reconciliation to actual usage; every failover path; Anthropic request translation (system field, no `temperature`, default model); output capped at the reservation on both providers; `stream: true` output; model allowlist; tenant isolation; `/metrics` auth; no keys in logs; **client → Task 3 → Task 4 → provider integration** (PII redacted both ways, 429 propagated) |
+| `task3.test.ts` | 35 | Deeply nested PII redacted (objects, arrays and mixed structures up to 100,000 levels; inbound and outbound end-to-end; `__proto__` keys kept as data); SSE parser at every split point, byte by byte, with CRLF/CR, incomplete and oversized events; redactor ≡ `redact(full)` at every split point, char by char and under fuzz; bounded memory; byte-sliced end-to-end streams; single `[DONE]`; malformed frames dropped; missing `[DONE]`; client disconnect cancels the upstream; TTFT < 500 ms; client auth (401, upstream never called, key never forwarded); PII in tool-call arguments, `refusal` and `reasoning_content` split across frames; `logprobs` stripped; inbound tool-call history redacted; no PII in logs |
+| `task4.test.ts` | 34 | Token estimation: `gpt-tokenizer` loaded by default and exact on non-English text, heuristic fallback when it can't be imported, at most 50,000 characters tokenized per request, overflow never under-estimated, 4 MB adversarial body estimated in milliseconds; Exact 429 and `Retry-After`; storage failure → 503 with the process still serving, failed reconciliation still delivers the answer, unexpected handler error → sanitised 500; oversized → 400; 25 concurrent requests and 4 worker processes sharing one DB with no over-allocation; persistence across restarts; reconciliation to actual usage; every failover path; Anthropic request translation (system field, no `temperature`, default model); output capped at the reservation on both providers; `stream: true` output; model allowlist; tenant isolation; `/metrics` auth; no keys in logs; **client → Task 3 → Task 4 → provider integration** (PII redacted both ways, 429 propagated) |
 
 ### Not verified
 
@@ -574,7 +574,7 @@ The suites use `node:test`. They start the real services on ephemeral ports, spa
 
 - **Provider timeout.** `PROVIDER_TIMEOUT_MS` defaults to 3 s per provider, which suits short completions. Long generations need a higher value, or both providers will time out (504).
 - **Synchronous SQLite.** `node:sqlite` calls are synchronous. Under heavy lock contention between several router processes, a write can briefly block a process's event loop, bounded by `busy_timeout` (5 s). Transactions are very short, so this matters only at high multi-process load.
-- **Token estimates.** Without `gpt-tokenizer` installed, input is estimated at about 4 characters per token. The provider's reported usage is the source of truth after each call; between reservation and reconciliation, a large underestimate of the input can overshoot the budget by that difference.
+- **Token estimates.** `gpt-tokenizer` uses OpenAI's o200k_base encoding; Claude's tokenizer differs, so estimates for the fallback provider are approximate. If the package can't be loaded, the fallback heuristic (4 characters per token) can underestimate non-English text by more than 2×. The provider's reported usage is the source of truth after each call; between reservation and reconciliation, a large underestimate of the input can overshoot the budget by that difference.
 - **Router streaming.** In Task 4, `stream: true` delivers the finished answer in streaming format; tokens are not relayed incrementally from the provider.
 - **PII detection** is pattern-based (email, SSN, card, phone). Other identifier types, such as names, addresses or IBANs, are not detected. Over-redaction (for example, a 13–19 digit order number) is the intended failure mode.
 
@@ -605,6 +605,7 @@ src/
 | Storage | `node:sqlite` (WAL, `BEGIN IMMEDIATE`) | Built in; atomic across processes; no native build |
 | Claude | `@anthropic-ai/sdk` | Official SDK, typed errors |
 | HTTP | Express 4 | Minimal and well understood |
+| Token counting | `gpt-tokenizer` (pinned 4.1.0, MIT, no dependencies) | Accurate estimates, including non-English text; work bounded per request |
 | Tests | `node:test` | Built in; no test-framework dependency |
 
 ---
