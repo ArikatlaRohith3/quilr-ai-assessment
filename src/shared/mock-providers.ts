@@ -91,13 +91,19 @@ async function failOrDelay(res: http.ServerResponse, o: MockLlmOptions): Promise
   return false;
 }
 
+/** Like a real provider, never generate more output tokens than the request's max_tokens. */
+function capOutput(usage: { input: number; output: number } | false, body: any): { input: number; output: number } | false {
+  if (!usage || typeof body?.max_tokens !== "number") return usage;
+  return { input: usage.input, output: Math.min(usage.output, body.max_tokens) };
+}
+
 export async function mockOpenAI(options: MockLlmOptions = {}): Promise<MockLlm> {
   // Handlers read `mock.options` at request time, so tests can reassign it between requests.
   let mock!: MockLlm;
   const srv = await start(async (_req, res, body) => {
     const o = mock.options;
     if (await failOrDelay(res, o)) return;
-    const usage = o.usage === undefined ? { input: 11, output: 7 } : o.usage;
+    const usage = capOutput(o.usage === undefined ? { input: 11, output: 7 } : o.usage, body);
     json(res, 200, {
       id: "chatcmpl-mock",
       object: "chat.completion",
@@ -117,7 +123,7 @@ export async function mockAnthropic(options: MockLlmOptions = {}): Promise<MockL
     const o = mock.options;
     if (!req.url?.startsWith("/v1/messages")) return json(res, 404, { type: "error", error: { type: "not_found_error", message: "not found" } });
     if (await failOrDelay(res, o)) return;
-    const usage = o.usage === undefined ? { input: 13, output: 9 } : o.usage;
+    const usage = capOutput(o.usage === undefined ? { input: 13, output: 9 } : o.usage, body);
     json(res, 200, {
       id: "msg_mock",
       type: "message",

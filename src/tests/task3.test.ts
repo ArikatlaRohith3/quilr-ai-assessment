@@ -6,6 +6,11 @@ import { StreamRedactor } from "../task3-llm-guardrail/stream-redactor.js";
 import { createGuardrailApp } from "../task3-llm-guardrail/index.js";
 import { mockSseUpstream, sseFrames, writeInSlices } from "../shared/mock-providers.js";
 import { serve, rng, sleep, captureLogs } from "./helpers.js";
+import { ApiKeyRegistry } from "../shared/api-keys.js";
+
+const CLIENT_KEY = "guardrail-client-key-0123456789";
+const CLIENTS = new ApiKeyRegistry([{ id: "test-app", apiKey: CLIENT_KEY }]);
+const CLIENT_HEADERS = { "Content-Type": "application/json", Authorization: `Bearer ${CLIENT_KEY}` };
 
 const PII = ["jane.doe@example.com", "123-45-6789", "4111 1111 1111 1111", "4111-1111-1111-1111", "4111111111111111", "(555) 867-5309", "+1 555 867 5309", "555.867.5309", "+447911123456"];
 
@@ -133,7 +138,7 @@ describe("Task 3 — streaming redactor", () => {
 // ── End-to-end through the HTTP proxy ─────────────────────────────────────────
 
 async function collect(url: string, body: unknown = { model: "m", messages: [{ role: "user", content: "hi" }] }) {
-  const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: CLIENT_HEADERS, body: JSON.stringify(body) });
   const raw = await res.text();
   const events = raw.split("\n\n").filter(Boolean).map((f) => f.replace(/^data: /, ""));
   const content = events
@@ -146,7 +151,7 @@ async function collect(url: string, body: unknown = { model: "m", messages: [{ r
 
 async function withGuardrail<T>(script: Parameters<typeof mockSseUpstream>[0], fn: (url: string, upstream: Awaited<ReturnType<typeof mockSseUpstream>>) => Promise<T>, status?: number) {
   const upstream = await mockSseUpstream(script, { status });
-  const gw = await serve(createGuardrailApp({ upstreamBaseUrl: upstream.url, apiKey: "sk-test", idleTimeoutMs: 2000 }));
+  const gw = await serve(createGuardrailApp({ upstreamBaseUrl: upstream.url, apiKey: "sk-test", clients: CLIENTS, idleTimeoutMs: 2000 }));
   try {
     return await fn(gw.url, upstream);
   } finally {
@@ -211,7 +216,7 @@ describe("Task 3 — guardrail proxy end-to-end", () => {
 
   test("upstream HTTP errors are sanitized", async () => {
     const r = await withGuardrail(async () => {}, async (url) => {
-      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }) });
+      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: CLIENT_HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }) });
       return { status: res.status, text: await res.text() };
     }, 500);
     assert.equal(r.status, 502);
@@ -224,7 +229,7 @@ describe("Task 3 — guardrail proxy end-to-end", () => {
       for (let i = 0; i < 200 && !res.destroyed; i++) { res.write(sseFrames(["more "], { done: false })); await sleep(50); }
     }, async (url, upstream) => {
       const ac = new AbortController();
-      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }), signal: ac.signal });
+      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: CLIENT_HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }), signal: ac.signal });
       const reader = res.body!.getReader();
       await reader.read();
       ac.abort();
@@ -241,7 +246,7 @@ describe("Task 3 — guardrail proxy end-to-end", () => {
       res.write(sseFrames(["done"]));
     }, async (url) => {
       const t0 = Date.now();
-      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }) });
+      const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: CLIENT_HEADERS, body: JSON.stringify({ messages: [{ role: "user", content: "x" }] }) });
       const reader = res.body!.getReader();
       const dec = new TextDecoder();
       let seen = "";
@@ -258,5 +263,126 @@ describe("Task 3 — guardrail proxy end-to-end", () => {
     assertNoLeak(logs);
     assert.match(logs, /inbound_redactions/);
     assert.match(logs, /outbound_redactions/);
+  });
+});
+
+// ─────────────── audit fixes: client auth (C2) and non-content fields (C1) ───────────────
+
+const frame = (choice: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+  `data: ${JSON.stringify({ id: "chatcmpl-x", object: "chat.completion.chunk", created: 1, model: "gpt-mock", choices: [{ index: 0, finish_reason: null, ...choice }], ...extra })}\n\n`;
+
+/** Reassembles every streamed text field the client received, per choice 0. */
+function reassemble(raw: string) {
+  const out = { content: "", refusal: "", reasoning_content: "", tools: new Map<number, { name: string; args: string }>() };
+  for (const ev of raw.split("\n\n").filter((e) => e.startsWith("data: {"))) {
+    const c = JSON.parse(ev.slice(6));
+    for (const ch of c.choices ?? []) {
+      const d = ch.delta ?? {};
+      for (const f of ["content", "refusal", "reasoning_content"] as const) if (typeof d[f] === "string") out[f] += d[f];
+      for (const tc of d.tool_calls ?? []) {
+        const t = out.tools.get(tc.index) ?? { name: "", args: "" };
+        if (tc.function?.name) t.name += tc.function.name;
+        if (typeof tc.function?.arguments === "string") t.args += tc.function.arguments;
+        out.tools.set(tc.index, t);
+      }
+    }
+  }
+  return out;
+}
+
+describe("Task 3 — client authentication (audit C2)", () => {
+  test("missing, malformed or unknown client keys → 401 and the upstream is never called", async () => {
+    let upstreamCalls = 0;
+    await withGuardrail(async (res) => { upstreamCalls++; res.write(sseFrames(["hi"])); }, async (url) => {
+      for (const auth of [undefined, "", "Bearer", `Basic ${CLIENT_KEY}`, "Bearer wrong-key-0123456789abc", `Bearer ${CLIENT_KEY}x`]) {
+        const headers: Record<string, string> = { "Content-Type": "application/json", ...(auth !== undefined ? { Authorization: auth } : {}) };
+        const res = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
+        assert.equal(res.status, 401, String(auth));
+        assert.match(res.headers.get("www-authenticate") ?? "", /Bearer/);
+        assert.deepEqual(await res.json(), { error: { code: 401, message: "Invalid or missing API key", source: "llm-guardrail" } });
+      }
+    });
+    assert.equal(upstreamCalls, 0, "unauthenticated requests must not reach the upstream");
+  });
+
+  test("the client's key is never forwarded; the upstream sees only the operator key", async () => {
+    await withGuardrail(async (res) => { res.write(sseFrames(["hi"])); }, async (url, upstream) => {
+      assert.equal((await collect(url)).status, 200);
+      assert.equal(upstream.requests[0].headers.authorization, "Bearer sk-test");
+      assert.ok(!JSON.stringify(upstream.requests[0]).includes(CLIENT_KEY));
+    });
+  });
+
+  test("ApiKeyRegistry rejects short keys and bad ids at startup", () => {
+    assert.throws(() => new ApiKeyRegistry([{ id: "a", apiKey: "short" }]), /at least 16/);
+    assert.throws(() => new ApiKeyRegistry([{ id: "bad id!", apiKey: "x".repeat(20) }]), /invalid client id/);
+  });
+});
+
+describe("Task 3 — PII outside delta.content (audit C1)", () => {
+  const ARGS = JSON.stringify({ to: PII[0], ssn: PII[1], card: PII[2], note: "call (555) 867-5309" });
+
+  test("tool_calls arguments split across frames (and bytes) are redacted; the JSON stays intact", async () => {
+    // Split the arguments at every 5th char, and tool-call 1 interleaved with tool-call 0.
+    const pieces = ARGS.match(/.{1,5}/gs)!;
+    let sse = frame({ delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_a", type: "function", function: { name: "send_email", arguments: "" } }] } });
+    sse += frame({ delta: { tool_calls: [{ index: 1, id: "call_b", type: "function", function: { name: "lookup", arguments: "" } }] } });
+    pieces.forEach((p, i) => {
+      sse += frame({ delta: { tool_calls: [{ index: 0, function: { arguments: p } }] } });
+      if (i % 3 === 0) sse += frame({ delta: { tool_calls: [{ index: 1, function: { arguments: i === 0 ? '{"email":"jane.d' : i === 3 ? 'oe@example.com"}' : "" } }] } });
+    });
+    sse += frame({ delta: {}, finish_reason: "tool_calls" }) + "data: [DONE]\n\n";
+    for (const sizes of [[1], [7], [4096]]) {
+      const r = await withGuardrail((res) => writeInSlices(res, sse, sizes), (url) => collect(url));
+      assertNoLeak(r.raw);
+      const got = reassemble(r.raw);
+      assert.equal(got.tools.get(0)!.name, "send_email");
+      assert.equal(got.tools.get(0)!.args, redact(ARGS), `slices ${sizes}`);
+      assert.deepEqual(JSON.parse(got.tools.get(0)!.args), { to: "[REDACTED]", ssn: "[REDACTED]", card: "[REDACTED]", note: "call [REDACTED]" });
+      assert.equal(got.tools.get(1)!.args, '{"email":"[REDACTED]"}');
+      assert.equal(r.events.filter((e) => e === "[DONE]").length, 1);
+    }
+  });
+
+  test("refusal and reasoning_content streams are redacted across frames", async () => {
+    const sse =
+      frame({ delta: { refusal: "I can't share 4111 11" } }) + frame({ delta: { refusal: "11 1111 1111." } }) +
+      frame({ delta: { reasoning_content: "user mail is jane." } }) + frame({ delta: { reasoning_content: "doe@example.com" } }) +
+      frame({ delta: {}, finish_reason: "stop" }) + "data: [DONE]\n\n";
+    const r = await withGuardrail(async (res) => { res.write(sse); }, (url) => collect(url));
+    assertNoLeak(r.raw);
+    const got = reassemble(r.raw);
+    assert.equal(got.refusal, "I can't share [REDACTED].");
+    assert.equal(got.reasoning_content, "user mail is [REDACTED]");
+  });
+
+  test("logprobs are stripped (request and response); unknown string fields are redacted whole", async () => {
+    const sse =
+      frame({ delta: { content: "ok " }, logprobs: { content: [{ token: PII[0], logprob: -0.1, top_logprobs: [{ token: PII[1] }] }] } }) +
+      frame({ delta: { content: "", audio: { transcript: `my ssn is ${PII[1]}` } }, provider_note: `card ${PII[2]}` }, { system_fingerprint: `fp ${PII[0]}` }) +
+      frame({ delta: {}, finish_reason: "stop" }) + "data: [DONE]\n\n";
+    await withGuardrail(async (res) => { res.write(sse); }, async (url, upstream) => {
+      const r = await collect(url, { messages: [{ role: "user", content: "hi" }], logprobs: true, top_logprobs: 5 });
+      assertNoLeak(r.raw);
+      assert.match(r.raw, /"logprobs":null/);
+      assert.match(r.raw, /my ssn is \[REDACTED\]/);
+      assert.equal(upstream.requests[0].body.logprobs, undefined, "logprobs must not be requested upstream");
+      assert.equal(upstream.requests[0].body.top_logprobs, undefined);
+    });
+  });
+
+  test("inbound: PII inside assistant tool_calls history and tool results is redacted before it goes upstream", async () => {
+    await withGuardrail(async (res) => { res.write(sseFrames(["ok"])); }, async (url, upstream) => {
+      await collect(url, {
+        messages: [
+          { role: "user", content: "email jane" },
+          { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "send", arguments: JSON.stringify({ to: PII[0] }) } }] },
+          { role: "tool", tool_call_id: "call_1", content: `sent to ${PII[0]}, ref ${PII[1]}` },
+        ],
+      });
+      const sent = JSON.stringify(upstream.requests[0].body);
+      assertNoLeak(sent);
+      assert.equal(upstream.requests[0].body.messages[1].tool_calls[0].id, "call_1", "structure is preserved");
+    });
   });
 });

@@ -30,7 +30,7 @@ interface Harness {
   close(): Promise<void>;
 }
 
-async function harness(opts: { limit?: number; timeoutMs?: number; dbFile?: string } = {}): Promise<Harness> {
+async function harness(opts: { limit?: number; timeoutMs?: number; dbFile?: string; defaultOutputReservation?: number } = {}): Promise<Harness> {
   const primary = await mockOpenAI();
   const secondary = await mockAnthropic();
   const limiter = new RateLimiter(openDatabase(opts.dbFile ?? ":memory:"), { limit: opts.limit ?? 50_000, windowMs: 60_000 });
@@ -44,7 +44,7 @@ async function harness(opts: { limit?: number; timeoutMs?: number; dbFile?: stri
     router,
     tenants: new TenantRegistry([{ tenantId: "tenant-a", apiKey: KEY_A }, { tenantId: "tenant-b", apiKey: KEY_B }]),
     tokenizer: heuristicTokenizer,
-    defaultOutputReservation: 0,
+    defaultOutputReservation: opts.defaultOutputReservation ?? 1,
     metricsToken: "metrics-token",
   });
   const running: Running = await serve(app);
@@ -54,9 +54,9 @@ async function harness(opts: { limit?: number; timeoutMs?: number; dbFile?: stri
   };
 }
 
-/** A request whose estimate is exactly `tokens` with the heuristic tokenizer and max_tokens=0 reservation. */
+/** A request whose estimate is exactly `tokens` with the heuristic tokenizer and the harness default 1-token output reservation. */
 function bodyOfTokens(tokens: number, extra: Record<string, unknown> = {}) {
-  const overhead = 3 + 4; // request + one message
+  const overhead = 3 + 4 + 1; // request + one message + 1 reserved output token
   return { model: "gpt-test", messages: [{ role: "user", content: "x".repeat((tokens - overhead) * 4) }], ...extra };
 }
 
@@ -174,7 +174,7 @@ describe("Task 4 — rate limiting", () => {
     const h = await harness({ limit: 10_000 });
     try {
       h.primary.options.usage = { input: 20, output: 5 };
-      const r = await post(h.url, bodyOfTokens(500));
+      const r = await post(h.url, bodyOfTokens(500, { max_tokens: 10 })); // estimate 509; provider reports 25
       assert.equal(r.status, 200);
       assert.deepEqual(r.body.usage, { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25, estimated: false });
       assert.equal(h.limiter.usage("tenant-a"), 25);
@@ -309,6 +309,55 @@ describe("Task 4 — tenant isolation & secrecy", () => {
       });
       for (const secret of [KEY_A, PRIMARY_KEY, SECONDARY_KEY, "sk-live-SECRET", "handler.js"]) assert.ok(!logs.includes(secret), `log leaked ${secret}`);
       assert.match(logs, /failing over/);
+    } finally { await h.close(); }
+  });
+});
+
+// ─────────────── audit fix H2: omitting max_tokens cannot bypass the limit ───────────────
+
+describe("Task 4 — output is capped by the reservation (audit H2)", () => {
+  const essay = { model: "gpt-test", messages: [{ role: "user", content: "write a very long essay" }] };
+
+  test("requests without max_tokens send max_tokens = reserved output to the provider", async () => {
+    const h = await harness({ defaultOutputReservation: 256 });
+    try {
+      assert.equal((await post(h.url, essay)).status, 200);
+      assert.equal(h.primary.requests[0].body.max_tokens, 256);
+      assert.equal((await post(h.url, { ...essay, max_tokens: 64 })).status, 200);
+      assert.equal(h.primary.requests[1].body.max_tokens, 64, "an explicit max_tokens is kept");
+    } finally { await h.close(); }
+  });
+
+  test("the fallback provider gets the same cap", async () => {
+    const h = await harness({ defaultOutputReservation: 256 });
+    try {
+      h.primary.options = { mode: "429" };
+      const r = await post(h.url, essay);
+      assert.equal(r.headers.get("x-gateway-provider"), "anthropic");
+      assert.equal(h.secondary.requests[0].body.max_tokens, 256);
+    } finally { await h.close(); }
+  });
+
+  test("a burst of over-generating requests without max_tokens never exceeds the limit", async () => {
+    const h = await harness({ limit: 10_000, defaultOutputReservation: 1024 });
+    try {
+      // The model would happily write 9,000 tokens per reply; only max_tokens stops it.
+      h.primary.options = { usage: { input: 10, output: 9000 } };
+      const statuses = await Promise.all(Array.from({ length: 12 }, () => post(h.url, essay).then((r) => r.status)));
+      const admitted = statuses.filter((s) => s === 200).length;
+      assert.ok(admitted >= 1 && statuses.every((s) => s === 200 || s === 429), String(statuses));
+      const used = h.limiter.usage("tenant-a");
+      assert.ok(used <= 10_000, `charged ${used} tokens against a 10,000 limit`);
+      for (const req of h.primary.requests) assert.equal(req.body.max_tokens, 1024);
+    } finally { await h.close(); }
+  });
+
+  test("a zero or invalid output reservation is refused at startup", async () => {
+    const h = await harness();
+    try {
+      for (const bad of [0, -1, 1.5, NaN]) {
+        assert.throws(() => createRouterApp({ limiter: h.limiter, router: null as any, tenants: new TenantRegistry([]), tokenizer: heuristicTokenizer, defaultOutputReservation: bad }), /defaultOutputReservation/, String(bad));
+      }
     } finally { await h.close(); }
   });
 });

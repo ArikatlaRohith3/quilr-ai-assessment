@@ -48,6 +48,10 @@ const safeEqual = (a: string, b: string) => {
 
 export function createRouterApp(opts: RouterAppOptions) {
   const { limiter, tenants, router, tokenizer } = opts;
+  // The reservation doubles as the provider's output cap, so it must be a real limit.
+  if (!Number.isInteger(opts.defaultOutputReservation) || opts.defaultOutputReservation < 1) {
+    throw new Error("defaultOutputReservation must be a positive integer (it caps max_tokens for requests that omit it)");
+  }
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "4mb" }));
@@ -88,7 +92,9 @@ export function createRouterApp(opts: RouterAppOptions) {
     const request: NormalizedRequest = {
       model: parsed.data.model,
       messages: parsed.data.messages,
-      max_tokens: parsed.data.max_tokens,
+      // Always sent to the provider: output can never exceed the output tokens reserved below.
+      // Without this, a request omitting max_tokens reserves the default but may generate far more.
+      max_tokens: parsed.data.max_tokens ?? opts.defaultOutputReservation,
       temperature: parsed.data.temperature,
     };
 

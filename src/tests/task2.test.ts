@@ -7,6 +7,9 @@ import { createGatewayApp } from "../task2-mcp-gateway/index.js";
 import { createMockDownstream } from "../task2-mcp-gateway/mock-downstream/index.js";
 import { HttpDownstream, StdioDownstream } from "../task2-mcp-gateway/proxy.js";
 import { signToken, verifyToken, AuthError, type AuthConfig } from "../task2-mcp-gateway/auth.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpError, LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { serve, captureLogs, type Running } from "./helpers.js";
 
 const auth: AuthConfig = { secret: "test-secret-0123456789-abcdefghijklmnop", issuer: "quilr-auth", audience: "quilr-mcp-gateway" };
@@ -82,7 +85,7 @@ describe("Task 2 — gateway with HTTP downstream", () => {
   test("viewer is blocked from admin_ tools with -32001 (any casing)", async () => {
     for (const name of ["admin_reset_key", "ADMIN_reset_key", "Admin_Purge_Cache"]) {
       const r = await rpc(gw.url, call("req-7", name, {}), viewer);
-      assert.equal(r.status, 403);
+      assert.equal(r.status, 200, "JSON-RPC errors on well-formed requests use HTTP 200 (MCP Streamable HTTP)");
       assert.deepEqual(r.body, { jsonrpc: "2.0", id: "req-7", error: { code: -32001, message: "Unauthorized Tool Call" } });
     }
   });
@@ -116,7 +119,8 @@ describe("Task 2 — gateway with HTTP downstream", () => {
     assert.equal(parse.body.error.code, -32700);
 
     assert.equal((await rpc(gw.url, { id: 1, method: "tools/list" }, admin)).body.error.code, -32600); // no jsonrpc
-    assert.equal((await rpc(gw.url, { jsonrpc: "2.0", method: "tools/list" }, admin)).body.error.code, -32600); // notification
+    assert.equal((await rpc(gw.url, { jsonrpc: "2.0", id: null, method: "tools/list" }, admin)).body.error.code, -32600); // null id
+    assert.equal((await rpc(gw.url, { jsonrpc: "2.0", id: { x: 1 }, method: "tools/list" }, admin)).body.error.code, -32600); // object id
     assert.equal((await rpc(gw.url, [call(1, "get_data")], admin)).body.error.code, -32600); // batch
     assert.equal((await rpc(gw.url, { jsonrpc: "2.0", id: 1, method: "resources/read" }, admin)).body.error.code, -32601);
   });
@@ -124,7 +128,7 @@ describe("Task 2 — gateway with HTTP downstream", () => {
   test("malformed tools/call params → -32602", async () => {
     for (const bad of [call(9, undefined), call(9, 123), call(9, ""), call(9, " admin_x"), call(9, "get_data", [1, 2]), { jsonrpc: "2.0", id: 9, method: "tools/call", params: "x" }]) {
       const r = await rpc(gw.url, bad, admin);
-      assert.equal(r.status, 400, JSON.stringify(bad));
+      assert.equal(r.status, 200, JSON.stringify(bad));
       assert.equal(r.body.error.code, -32602, JSON.stringify(bad));
       assert.equal(r.body.id, 9);
     }
@@ -161,7 +165,7 @@ describe("Task 2 — downstream failures", () => {
     const gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(slow.url, 100) }));
     try {
       const r = await rpc(gw.url, call(1, "get_data", {}), viewer);
-      assert.equal(r.status, 504);
+      assert.equal(r.status, 200);
       assert.deepEqual(r.body, { jsonrpc: "2.0", id: 1, error: { code: -32003, message: "Downstream MCP server timed out" } });
     } finally {
       await gw.close();
@@ -175,7 +179,7 @@ describe("Task 2 — downstream failures", () => {
     for (const url of ["http://127.0.0.1:1", bad.url]) {
       const gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(url, 1000) }));
       const r = await rpc(gw.url, call(1, "get_data", {}), viewer);
-      assert.equal(r.status, 502);
+      assert.equal(r.status, 200);
       assert.deepEqual(r.body.error, { code: -32002, message: "Downstream MCP server unavailable" });
       await gw.close();
     }
@@ -217,5 +221,107 @@ describe("Task 2 + Task 1 — gateway bridged to the real MCP server over stdio"
   test("viewer is still blocked before anything reaches the MCP server", async () => {
     const r = await rpc(gw.url, call(1, "admin_reset_key", {}), viewer);
     assert.equal(r.body.error.code, -32001);
+  });
+});
+
+// ─────────────── audit fix H1: real MCP clients can use the gateway ───────────────
+
+async function sdkClient(url: string, token: string): Promise<Client> {
+  const client = new Client({ name: "audit-probe", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+  return client;
+}
+
+describe("Task 2 — MCP Streamable HTTP compliance (audit H1)", () => {
+  let down: Running;
+  let gw: Running;
+  before(async () => {
+    down = await serve(createMockDownstream());
+    gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(down.url, 2000) }));
+  });
+  after(async () => { await gw.close(); await down.close(); });
+
+  test("initialize is answered by the gateway (version negotiated, tools capability only)", async () => {
+    const init = (protocolVersion: string) => rpc(gw.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion, capabilities: {}, clientInfo: { name: "c", version: "1" } } }, viewer);
+    const r = await init("2025-06-18");
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.result, { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "quilr-mcp-gateway", version: "2.1.0" } });
+    assert.equal((await init("1999-01-01")).body.result.protocolVersion, LATEST_PROTOCOL_VERSION, "unknown versions fall back to the latest");
+  });
+
+  test("initialize still requires authentication", async () => {
+    const r = await rpc(gw.url, { jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    assert.equal(r.status, 401);
+    assert.equal(r.body.error.code, -32000);
+  });
+
+  test("notifications → 202 with no body; unauthenticated notifications → 401", async () => {
+    const send = (token?: string) => fetch(gw.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+    const ok = await send(viewer);
+    assert.equal(ok.status, 202);
+    assert.equal(await ok.text(), "");
+    assert.equal((await send()).status, 401);
+  });
+
+  test("GET and DELETE → 405 (no SSE stream, no sessions)", async () => {
+    for (const method of ["GET", "DELETE"]) {
+      const r = await fetch(gw.url, { method, headers: { Authorization: `Bearer ${viewer}` } });
+      assert.equal(r.status, 405, method);
+      assert.equal(r.headers.get("allow"), "POST");
+    }
+  });
+
+  test("official MCP SDK client: connect, list tools, call an allowed tool", async () => {
+    const client = await sdkClient(gw.url, viewer);
+    try {
+      assert.deepEqual(client.getServerVersion(), { name: "quilr-mcp-gateway", version: "2.1.0" });
+      assert.equal((await client.listTools()).tools.length, 3);
+      const r = await client.callTool({ name: "get_data", arguments: {} });
+      assert.equal((r.content as any)[0].text, "Executed tool: get_data");
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("official MCP SDK client: a blocked admin call surfaces as McpError -32001, not a transport error", async () => {
+    const client = await sdkClient(gw.url, viewer);
+    try {
+      await assert.rejects(client.callTool({ name: "admin_reset_key", arguments: {} }), (err: unknown) => {
+        assert.ok(err instanceof McpError, `expected McpError, got ${String(err)}`);
+        assert.equal(err.code, -32001);
+        return true;
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("official MCP SDK client with a forged token cannot connect", async () => {
+    await assert.rejects(sdkClient(gw.url, Buffer.from("role:admin").toString("base64")));
+  });
+
+  test("official MCP SDK client → gateway → real Task 1 server over stdio", async () => {
+    const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "../task1-mcp-server/index.js");
+    const downstream = new StdioDownstream(process.execPath, [script], 5000);
+    const bridged = await serve(createGatewayApp({ auth, downstream }));
+    const client = await sdkClient(bridged.url, viewer);
+    try {
+      assert.deepEqual((await client.listTools()).tools.map((t) => t.name).sort(), ["get_customer_record", "trigger_refund"]);
+      const ok = await client.callTool({ name: "get_customer_record", arguments: { customer_id: "CUST-00123" } });
+      assert.equal(JSON.parse((ok.content as any)[0].text).customer_id, "CUST-00123");
+      await assert.rejects(client.callTool({ name: "get_customer_record", arguments: { customer_id: "INVALID" } }), (err: unknown) => {
+        assert.ok(err instanceof McpError);
+        assert.equal(err.code, -32602);
+        return true;
+      });
+    } finally {
+      await client.close();
+      await bridged.close();
+      await downstream.close();
+    }
   });
 });

@@ -16,6 +16,7 @@ import { createMockDownstream } from "../task2-mcp-gateway/mock-downstream/index
 import { HttpDownstream, StdioDownstream } from "../task2-mcp-gateway/proxy.js";
 import { signToken } from "../task2-mcp-gateway/auth.js";
 import { createGuardrailApp } from "../task3-llm-guardrail/index.js";
+import { ApiKeyRegistry } from "../shared/api-keys.js";
 import { openDatabase } from "../task4-rate-limiter/database.js";
 import { RateLimiter } from "../task4-rate-limiter/rate-limiter.js";
 import { TenantRegistry } from "../task4-rate-limiter/tenants.js";
@@ -127,9 +128,9 @@ async function task3() {
   console.log(C.dim(`  upstream deltas (split mid-PII, bytes sent 7 at a time): ${JSON.stringify(deltas)}`));
   const upstream = await mockSseUpstream((res) => writeInSlices(res, sseFrames(deltas), [7]));
   closers.push(() => upstream.close());
-  const gw = await listen(createGuardrailApp({ upstreamBaseUrl: upstream.url, apiKey: "demo" }));
+  const gw = await listen(createGuardrailApp({ upstreamBaseUrl: upstream.url, apiKey: "demo", clients: new ApiKeyRegistry([{ id: "demo-app", apiKey: "demo-guardrail-key-0123456789" }]) }));
   const res = await fetch(`${gw}/v1/chat/completions`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer demo-guardrail-key-0123456789" },
     body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "My SSN is 987-65-4321" }] }),
   });
   const raw = await res.text();
@@ -154,7 +155,7 @@ async function task4() {
   );
   const key = "demo-tenant-key-0123456789";
   const url = await listen(createRouterApp({
-    limiter, router, tokenizer: heuristicTokenizer, defaultOutputReservation: 0,
+    limiter, router, tokenizer: heuristicTokenizer, defaultOutputReservation: 1,
     tenants: new TenantRegistry([{ tenantId: "demo", apiKey: key }]),
   }));
   const post = (content: string, k = key) => fetch(`${url}/v1/chat/completions`, {
@@ -163,17 +164,17 @@ async function task4() {
   });
 
   const statuses: number[] = [];
-  for (let i = 0; i < 4; i++) statuses.push((await post("x".repeat(1172))).status); // ≈300 tokens each
+  for (let i = 0; i < 4; i++) statuses.push((await post("x".repeat(1168))).status); // 300 tokens each (292 + 8 overhead incl. 1 reserved output token)
   check("sliding window", `statuses ${statuses.join(", ")}`, statuses.join() === "200,200,200,429");
 
-  const burst = await Promise.all(Array.from({ length: 10 }, () => post("y".repeat(372), "demo-tenant-key-0123456789"))); // ≈100 each, 100 left
+  const burst = await Promise.all(Array.from({ length: 10 }, () => post("y".repeat(368), "demo-tenant-key-0123456789"))); // 100 each, 100 left
   check("concurrent burst", `${burst.filter((r) => r.status === 200).length}/10 admitted with 100 tokens left`, burst.filter((r) => r.status === 200).length === 1);
 
   const other = await fetch(`${url}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", "X-Tenant-Key": "demo" }, body: "{}" });
   check("tenant auth", `X-Tenant-Key alone → HTTP ${other.status}`, other.status === 401);
 
   const fresh = new RateLimiter(openDatabase(":memory:"), { limit: 50_000, windowMs: 60_000 });
-  const url2 = await listen(createRouterApp({ limiter: fresh, router, tokenizer: heuristicTokenizer, defaultOutputReservation: 0, tenants: new TenantRegistry([{ tenantId: "demo", apiKey: key }]) }));
+  const url2 = await listen(createRouterApp({ limiter: fresh, router, tokenizer: heuristicTokenizer, defaultOutputReservation: 1, tenants: new TenantRegistry([{ tenantId: "demo", apiKey: key }]) }));
   primary.options.mode = "429";
   const fb = await fetch(`${url2}/v1/chat/completions`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }) });
   const fbBody = (await fb.json()) as any;

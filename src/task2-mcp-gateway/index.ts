@@ -5,11 +5,13 @@ import { fileURLToPath } from "node:url";
 import { AuthError, authConfigFromEnv, extractBearer, verifyToken, type AuthConfig, type Principal } from "./auth.js";
 import { ALLOWED_METHODS, TOOL_NAME_PATTERN, authorizeToolCall, policyFromEnv, type PolicyConfig } from "./authorization.js";
 import { DownstreamTimeoutError, HttpDownstream, StdioDownstream, type Downstream, type JsonRpcRequest } from "./proxy.js";
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import { JSONRPC, jsonRpcError, safeJsonRpcId, type JsonRpcId } from "../shared/errors.js";
 import { createLogger } from "../shared/logger.js";
 import { intFromEnv, isMain } from "../shared/runtime.js";
 
 const log = createLogger("mcp-gateway");
+const GATEWAY_INFO = { name: "quilr-mcp-gateway", version: "2.1.0" };
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 
 export interface GatewayOptions {
@@ -42,6 +44,21 @@ export function createGatewayApp({ auth, downstream, policy = {} }: GatewayOptio
 
   app.get("/health", (_req, res) => res.json({ status: "ok", service: "mcp-gateway", downstream: downstream.kind }));
 
+  // MCP Streamable HTTP: this gateway offers no server→client SSE stream and no
+  // stateful sessions, so GET (open stream) and DELETE (end session) are 405 — which
+  // the spec defines as "not supported" and clients handle gracefully.
+  app.get("/", (_req, res) => res.setHeader("Allow", "POST").status(405).end());
+  app.delete("/", (_req, res) => res.setHeader("Allow", "POST").status(405).end());
+
+  /**
+   * HTTP status policy (MCP Streamable HTTP):
+   *  - 400  the message itself is unusable (not JSON, batch, bad envelope, bad id)
+   *  - 401  missing/invalid credentials
+   *  - 202  notifications (accepted, no body)
+   *  - 200  every well-formed request — including JSON-RPC errors such as
+   *         -32001 Unauthorized Tool Call, so MCP clients receive them as protocol
+   *         errors instead of transport failures.
+   */
   app.post("/", async (req: Request, res: Response) => {
     const incoming = req.headers["x-request-id"];
     const requestId = typeof incoming === "string" && REQUEST_ID_PATTERN.test(incoming) ? incoming : randomUUID();
@@ -82,44 +99,61 @@ export function createGatewayApp({ auth, downstream, policy = {} }: GatewayOptio
       audit({ requestId, ...who, decision: "rejected", reason: "invalid envelope" });
       return reply(400, id, JSONRPC.INVALID_REQUEST, "Invalid JSON-RPC request");
     }
+    // Notifications (no id) get no JSON-RPC reply: 202 Accepted. None is forwarded
+    // downstream — the gateway owns the client-facing MCP session, and the stdio
+    // bridge runs its own handshake with the downstream server.
+    if (!("id" in msg)) {
+      audit({ requestId, ...who, method: msg.method, decision: "allowed", reason: "notification acknowledged", outcome: "not forwarded" });
+      return res.status(202).end();
+    }
     if (id === null) {
-      audit({ requestId, ...who, method: msg.method, decision: "rejected", reason: "missing or invalid id" });
-      return reply(400, null, JSONRPC.INVALID_REQUEST, "Request id must be a string or number (notifications are not supported)");
+      audit({ requestId, ...who, method: msg.method, decision: "rejected", reason: "invalid id" });
+      return reply(400, null, JSONRPC.INVALID_REQUEST, "Request id must be a string or number");
     }
     if (msg.params !== undefined && (msg.params === null || typeof msg.params !== "object" || Array.isArray(msg.params))) {
       audit({ requestId, ...who, method: msg.method, decision: "rejected", reason: "params not an object" });
-      return reply(400, id, JSONRPC.INVALID_PARAMS, "params must be an object");
+      return reply(200, id, JSONRPC.INVALID_PARAMS, "params must be an object");
     }
     const method = msg.method;
     const params = (msg.params ?? {}) as Record<string, unknown>;
 
-    // 4. Method allowlist (deny by default).
-    if (!ALLOWED_METHODS.has(method)) {
-      audit({ requestId, ...who, method, decision: "denied", reason: "method not allowed" });
-      return reply(400, id, JSONRPC.METHOD_NOT_FOUND, `Method not found: ${method}`);
+    // 4. MCP lifecycle: the gateway is the MCP server its clients talk to, so it answers
+    //    `initialize` itself, advertising only what it proxies (tools).
+    if (method === "initialize") {
+      const requested = params.protocolVersion;
+      const protocolVersion =
+        typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : LATEST_PROTOCOL_VERSION;
+      audit({ requestId, ...who, method, decision: "allowed", reason: "handled by gateway", outcome: `protocol ${protocolVersion}` });
+      return res.status(200).json({ jsonrpc: "2.0", id, result: { protocolVersion, capabilities: { tools: {} }, serverInfo: GATEWAY_INFO } });
     }
 
-    // 5. tools/call parameter validation + authorization.
+    // 5. Method allowlist (deny by default).
+    if (!ALLOWED_METHODS.has(method)) {
+      audit({ requestId, ...who, method, decision: "denied", reason: "method not allowed" });
+      return reply(200, id, JSONRPC.METHOD_NOT_FOUND, `Method not found: ${method}`);
+    }
+
+    // 6. tools/call parameter validation + authorization.
     let tool: string | undefined;
     if (method === "tools/call") {
       if (typeof params.name !== "string" || !TOOL_NAME_PATTERN.test(params.name)) {
         audit({ requestId, ...who, method, decision: "rejected", reason: "invalid tool name" });
-        return reply(400, id, JSONRPC.INVALID_PARAMS, "params.name must be a valid tool name");
+        return reply(200, id, JSONRPC.INVALID_PARAMS, "params.name must be a valid tool name");
       }
       const args = params.arguments;
       if (args !== undefined && (args === null || typeof args !== "object" || Array.isArray(args))) {
         audit({ requestId, ...who, method, tool: params.name, decision: "rejected", reason: "arguments not an object" });
-        return reply(400, id, JSONRPC.INVALID_PARAMS, "params.arguments must be an object");
+        return reply(200, id, JSONRPC.INVALID_PARAMS, "params.arguments must be an object");
       }
       tool = params.name;
       const decision = authorizeToolCall(principal, tool, policy);
       if (!decision.allowed) {
         audit({ requestId, ...who, method, tool, decision: "denied", reason: decision.reason });
-        return reply(403, id, JSONRPC.UNAUTHORIZED_TOOL, "Unauthorized Tool Call");
+        return reply(200, id, JSONRPC.UNAUTHORIZED_TOOL, "Unauthorized Tool Call");
       }
     }
 
-    // 6. Forward. Only the vetted fields are sent downstream.
+    // 7. Forward. Only the vetted fields are sent downstream.
     const forward: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
     const started = Date.now();
     try {
@@ -136,8 +170,8 @@ export function createGatewayApp({ auth, downstream, policy = {} }: GatewayOptio
         downstream_ms: Date.now() - started, outcome: timedOut ? "timeout" : "downstream error",
       });
       log.error("downstream failure", { requestId, error: (err as Error).message });
-      if (timedOut) return reply(504, id, JSONRPC.DOWNSTREAM_TIMEOUT, "Downstream MCP server timed out");
-      return reply(502, id, JSONRPC.DOWNSTREAM_ERROR, "Downstream MCP server unavailable");
+      if (timedOut) return reply(200, id, JSONRPC.DOWNSTREAM_TIMEOUT, "Downstream MCP server timed out");
+      return reply(200, id, JSONRPC.DOWNSTREAM_ERROR, "Downstream MCP server unavailable");
     }
   });
 
