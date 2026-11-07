@@ -11,7 +11,7 @@ This repository contains four services that together form a small, security-focu
 | 3 | **Streaming PII guardrail** | Proxies OpenAI-compatible streaming completions, redacting PII in requests and in the token stream | HTTP + SSE · `:3003` |
 | 4 | **Rate-limiting router** | Per-tenant token budget with atomic SQLite reservations, OpenAI → Claude failover | HTTP (JSON or SSE) · `:3004` |
 
-**Verified status (2026-11-07):** `npm ci` → `npm test` gives **118 / 118 tests passing** · `npm run demo` gives **21 / 21 checks** · `tsc --noEmit` is clean · `npm audit` reports 0 vulnerabilities. See [Testing](#testing) for the exact environment and what was *not* verified.
+**Verified status (2026-11-07):** `npm ci` → `npm test` gives **122 / 122 tests passing** on Node 22 and Node 26 · `npm run demo` gives **21 / 21 checks** · `tsc --noEmit` is clean · `npm audit` reports 0 vulnerabilities. See [Testing](#testing) for the exact environment and what was *not* verified.
 
 ---
 
@@ -80,14 +80,14 @@ Shared code lives in `src/shared/`:
 
 ### Prerequisites
 
-- **Node.js ≥ 22.13**, as declared in `package.json`; `node:sqlite` is built in from 22.13. This README was verified on **Node 26.12.1** (npm 11.20.0, Windows 11) only.
+- **Node.js ≥ 22.13**, as declared in `package.json`; `node:sqlite` is built in from 22.13. Verified on **Node 22.23.4** (LTS) and **Node 26.12.1**, both on Windows 11. On Node 22, Task 4 prints a harmless `ExperimentalWarning: SQLite is an experimental feature` to stderr.
 - No API keys are needed for the tests or the demo, which use local mock providers.
 
 ### Install, build, verify
 
 ```bash
 npm ci                 # reproducible install from package-lock.json
-npm test               # clean build (tsc) + all 118 tests
+npm test               # clean build (tsc) + all 122 tests
 npm run demo           # end-to-end demo of all four tasks; exits non-zero if any check fails
 ```
 
@@ -160,7 +160,7 @@ Services that need a secret refuse to start without it:
 | Tool | Arguments | Validation |
 |------|-----------|------------|
 | `get_customer_record` | `customer_id` | `^CUST-\d{5}$` (exactly five ASCII digits) |
-| `trigger_refund` | `customer_id`, `amount`, `reason` | `amount`: finite, > 0, ≤ 10 000, at most 2 decimals · `reason`: trimmed, ≥ 10 **non-whitespace** characters, ≤ 500 |
+| `trigger_refund` | `customer_id`, `amount`, `reason` | `amount`: finite, > 0, ≤ 10 000, at most 2 decimals · `reason`: ≥ 10 characters after trimming leading and trailing whitespace, ≤ 500 |
 
 ### Design
 
@@ -296,7 +296,7 @@ VIEWER=$(npm run -s token -- viewer alice 600)
 
 // invalid arguments: Task 1's structured error passes through the gateway
 → {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"trigger_refund","arguments":{"customer_id":"CUST-00123","amount":-5,"reason":"   "}}}
-← 200 {"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"MCP error -32602: Invalid params: amount: must be greater than 0; reason: must contain at least 10 non-whitespace characters","data":{"issues":[{"field":"amount","message":"must be greater than 0"},{"field":"reason","message":"must contain at least 10 non-whitespace characters"}]}}}
+← 200 {"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"MCP error -32602: Invalid params: amount: must be greater than 0; reason: must be at least 10 characters (leading and trailing whitespace is not counted)","data":{"issues":[{"field":"amount","message":"must be greater than 0"},{"field":"reason","message":"must be at least 10 characters (leading and trailing whitespace is not counted)"}]}}}
 
 // admin tool as viewer
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"admin_reset_key","arguments":{}}}
@@ -427,6 +427,8 @@ The budget is `MAX_TOKENS_PER_MINUTE` per tenant over a 60 s sliding window, per
    - On success, the reservation is **committed** at the provider's reported `usage`, or kept at the estimate if no usage was reported.
    - If no provider delivered a reply, it is **released** and the tenant isn't charged.
 
+**Storage failures.** If the SQLite store is unavailable (for example `SQLITE_BUSY` after `busy_timeout`, a full disk, or a permissions error), the request is refused with **503** `Rate limiter temporarily unavailable` and `Retry-After: 1`. The router fails closed: it never serves a request without accounting for it, and the process keeps running for every other tenant. If only the reconciliation step fails after a provider has answered, the answer is still delivered and the reservation stays at its estimate. Any other unexpected error in the handler becomes a sanitised 500 rather than an unhandled rejection.
+
 A request that doesn't fit gets **429**, with a `Retry-After` computed from when enough of the oldest usage leaves the window. Admitted and rate-limited responses carry `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
 
 ### Providers and failover
@@ -519,7 +521,7 @@ Some long IDs are abbreviated with `…`.
 | Forged or tampered agent identity | HS256 JWT: exact `alg` check, constant-time signature compare, required `exp`, `iss`/`aud` binding, role allowlist; claims parsed only after the signature verifies | `task2…/auth.ts` |
 | Privilege escalation through tool calls | Deny-by-default method allowlist; `admin_*` and `ADMIN_ONLY_TOOLS` need `role=admin`, matched case-insensitively against a restricted tool-name charset, so lookalike or padded names can't slip past; batches rejected | `task2…/authorization.ts`, `index.ts` |
 | Tool discovery by low-privilege callers | `tools/list` filtered by role | `task2…/authorization.ts` |
-| Argument smuggling or malformed input | Strict zod schemas (unknown fields rejected), finite-number and non-whitespace rules, `-32602` errors that never echo submitted values | `task1…/schemas.ts` |
+| Argument smuggling or malformed input | Strict zod schemas (unknown fields rejected), finite-number and trimmed-length rules, `-32602` errors that never echo submitted values | `task1…/schemas.ts` |
 | PII sent to or returned by an LLM | Inbound redaction of every message string; per-field outbound stream redaction with a provable chunk-boundary invariant; `logprobs` stripped; fail-closed handling of malformed frames and interrupted streams | `task3…/` |
 | Open proxy or credential misuse | Client keys required for Task 3 and tenant keys for Task 4, both stored as SHA-256 digests; caller keys never forwarded upstream; services refuse to start without keys | `shared/api-keys.ts` |
 | Budget exhaustion and cost abuse | Atomic reservations, output capped at the reservation, oversized requests rejected, model allowlist | `task4…/` |
@@ -544,27 +546,27 @@ The suites use `node:test`. They start the real services on ephemeral ports, spa
 
 ### Verified results
 
-**Environment:** 2026-11-07, Windows 11, Node 26.12.1, npm 11.20.0, starting from a clean `npm ci`.
+**Environment:** 2026-11-07, Windows 11, starting from a clean `npm ci`, run on both **Node 26.12.1** (npm 11.20.0) and **Node 22.23.4** (npm 10.9.9) with identical results.
 
 | Command | Result |
 |---------|--------|
-| `npm test` | **118 tests, 22 suites: 118 pass, 0 fail** (≈ 10.6 s) |
+| `npm test` | **122 tests, 23 suites: 122 pass, 0 fail, 0 skipped** (≈ 10 s on Node 26, ≈ 12.5 s on Node 22) |
 | `npm run demo` | **All 21 checks passed** |
 | `npx tsc --noEmit` | No errors |
 | `npm audit` | 0 vulnerabilities |
 
 | Suite | Tests | Coverage highlights |
 |-------|------:|---------------------|
-| `task1.test.ts` | 30 | Valid and invalid IDs; negative, zero, NaN and ±Infinity (`1e400` on the wire) amounts; empty and whitespace-only reasons; missing and unexpected fields; valid refund. Covered as schema tests and over the real stdio server, including the exact `-32602` response shape, `-32700`/`-32600` replies, stdout purity, startup failure → exit 1, uncaught exception → exit 1, and stdin close → exit 0 |
+| `task1.test.ts` | 31 | Valid and invalid IDs; negative, zero, NaN and ±Infinity (`1e400` on the wire) amounts; empty, whitespace-only and padded reasons, and 10-character reasons with an inner space (`"Wrong item"`) accepted; missing and unexpected fields; valid refund. Covered as schema tests and over the real stdio server, including the exact `-32602` response shape, `-32700`/`-32600` replies, stdout purity, startup failure → exit 1, uncaught exception → exit 1, and stdin close → exit 0 |
 | `task2.test.ts` | 34 | Forged base64, `alg:none`, tampered, wrong-secret, expired, wrong-`aud`/`iss`, unknown-role and missing-`exp` tokens; `admin_` in any casing; invalid envelopes; ID preservation; `X-Request-ID`; secret-free audit logs; **official MCP SDK client** (connect, list, call, `McpError -32001`, end to end to Task 1); `initialize`, 202 notifications, 405 GET/DELETE; role-filtered `tools/list`; `error.data` pass-through and size cap; hung-downstream cancel and replace; crash-loop backoff; stalled and oversized HTTP bodies |
 | `task3.test.ts` | 29 | SSE parser at every split point, byte by byte, with CRLF/CR, incomplete and oversized events; redactor ≡ `redact(full)` at every split point, char by char and under fuzz; bounded memory; byte-sliced end-to-end streams; single `[DONE]`; malformed frames dropped; missing `[DONE]`; client disconnect cancels the upstream; TTFT < 500 ms; client auth (401, upstream never called, key never forwarded); PII in tool-call arguments, `refusal` and `reasoning_content` split across frames; `logprobs` stripped; inbound tool-call history redacted; no PII in logs |
-| `task4.test.ts` | 25 | Exact 429 and `Retry-After`; oversized → 400; 25 concurrent requests and 4 worker processes sharing one DB with no over-allocation; persistence across restarts; reconciliation to actual usage; every failover path; Anthropic request translation (system field, no `temperature`, default model); output capped at the reservation on both providers; `stream: true` output; model allowlist; tenant isolation; `/metrics` auth; no keys in logs; **client → Task 3 → Task 4 → provider integration** (PII redacted both ways, 429 propagated) |
+| `task4.test.ts` | 28 | Exact 429 and `Retry-After`; storage failure → 503 with the process still serving, failed reconciliation still delivers the answer, unexpected handler error → sanitised 500; oversized → 400; 25 concurrent requests and 4 worker processes sharing one DB with no over-allocation; persistence across restarts; reconciliation to actual usage; every failover path; Anthropic request translation (system field, no `temperature`, default model); output capped at the reservation on both providers; `stream: true` output; model allowlist; tenant isolation; `/metrics` auth; no keys in logs; **client → Task 3 → Task 4 → provider integration** (PII redacted both ways, 429 propagated) |
 
 ### Not verified
 
 - Calls to the **real** OpenAI and Claude APIs. Every provider interaction in the tests and the demo uses local mocks, built to the documented request and response formats.
-- **Node 22.x** (the declared minimum) and **Linux/macOS**. Only the environment above was exercised.
-- `npm run simulate`, which needs a running router with provider keys, is provided as a manual tool and isn't part of the results above.
+- **Linux/macOS**, and Node versions between 22.13 and 22.23. Only the environments above were exercised.
+- `npm run simulate` was run manually against the router with mock providers (5 of 8 concurrent 10,000-token requests admitted, 3 rejected with 429). It isn't part of the automated results above.
 
 ---
 
@@ -613,7 +615,7 @@ src/
 
 | Area | v1 (removed) | Problem | Current implementation |
 |------|--------------|---------|------------------------|
-| Task 1 | `McpServer` with default zod objects | Validation failures came back as successful `isError` results; unknown fields were silently dropped; `Infinity` and whitespace-padded reasons passed | Low-level `Server`, real `-32602` errors, strict schemas, finite and non-whitespace rules |
+| Task 1 | `McpServer` with default zod objects | Validation failures came back as successful `isError` results; unknown fields were silently dropped; `Infinity` and whitespace-padded reasons passed | Low-level `Server`, real `-32602` errors, strict schemas, finite-number rule, reason length counted after trimming |
 | Task 2 auth | Unsigned base64 token (`base64("role:admin")`) | Anyone could forge an admin token | HS256-signed JWT with signature, `exp`, `iss`, `aud` and role verification |
 | Task 2 policy | `tools/list` and every method other than `tools/call` forwarded without authentication; `admin_` check case-sensitive; HTTP-only downstream (mock on port 3003) | No deny-by-default; a differently cased name such as `ADMIN_reset_key` skipped the check; the mock's port clashed with Task 3 | Authentication on every request, method allowlist, case-insensitive role policy, role-filtered `tools/list`, MCP Streamable HTTP, stdio bridge to Task 1, mock on `:3010` |
 | Task 3 | Fixed 64-character overlap buffer, `delta.content` only | PII longer than the overlap, or split unluckily, could leak; other fields were not redacted; anyone could use the operator's key | Incremental SSE parser + safe-cut redactor with a proven invariant, per-field redaction, client API keys |

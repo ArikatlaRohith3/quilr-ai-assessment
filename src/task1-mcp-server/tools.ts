@@ -49,7 +49,7 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "trigger_refund",
-    description: "Issue a refund to a customer. amount must be > 0 with at most 2 decimals; reason must contain at least 10 non-whitespace characters. Unknown fields are rejected.",
+    description: "Issue a refund to a customer. amount must be > 0 with at most 2 decimals; reason must be at least 10 characters (surrounding whitespace not counted). Unknown fields are rejected.",
     schema: TriggerRefundInput,
     handler: async ({ customer_id, amount, reason }: TriggerRefundArgs) => {
       // The reason is free text and may contain PII, so only its length is logged.

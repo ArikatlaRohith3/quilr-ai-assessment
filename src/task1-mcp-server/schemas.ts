@@ -14,9 +14,6 @@ export const MAX_REFUND_AMOUNT = 10_000;
 export const MIN_REASON_CHARS = 10;
 export const MAX_REASON_LENGTH = 500;
 
-/** At least MIN_REASON_CHARS non-whitespace characters anywhere in the string. Also emitted as JSON Schema `pattern`. */
-const REASON_PATTERN = new RegExp(`(?:\\S\\s*){${MIN_REASON_CHARS}}`);
-
 /** "is required" when the field is missing, "must be a <type>" when it has the wrong type. */
 const typeError = (type: string) => (issue: { input?: unknown }) =>
   issue.input === undefined ? "is required" : `must be a ${type}`;
@@ -38,9 +35,10 @@ export const RefundAmount = z
 
 export const RefundReason = z
   .string({ error: typeError("string") })
+  // Trimmed first, so padding can't satisfy the minimum: "          " and "   short   " fail,
+  // while a real 10-character reason such as "Wrong item" passes.
   .trim()
-  // Counts non-whitespace characters, so neither "          " nor "a         b" passes.
-  .regex(REASON_PATTERN, `must contain at least ${MIN_REASON_CHARS} non-whitespace characters`)
+  .min(MIN_REASON_CHARS, `must be at least ${MIN_REASON_CHARS} characters (leading and trailing whitespace is not counted)`)
   .max(MAX_REASON_LENGTH, `must be at most ${MAX_REASON_LENGTH} characters`);
 
 export const GetCustomerRecordInput = z.strictObject({ customer_id: CustomerId });

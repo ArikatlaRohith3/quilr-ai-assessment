@@ -118,12 +118,15 @@ describe("Task 1 — schemas (unit)", () => {
     for (const ok of [0.01, 1, 49.99, 10000]) assert.ok(refund({ amount: ok }).success, String(ok));
   });
 
-  test("reason needs ≥ 10 non-whitespace characters", () => {
-    for (const bad of ["", "          ", "\t\n  \r ", "short", "a         b", "x . . . . . . .", "123456789"]) {
+  test("reason needs ≥ 10 characters after trimming", () => {
+    for (const bad of ["", "          ", "\t\n  \r ", "short", "   short   ", "123456789", "  123456789  "]) {
       assert.equal(refund({ reason: bad }).success, false, JSON.stringify(bad));
     }
-    assert.ok(refund({ reason: "abcdefghij" }).success, "exactly 10 non-whitespace chars");
-    assert.ok(refund({ reason: "a b c d e f g h i j" }).success, "10 non-whitespace chars with spaces between");
+    assert.ok(refund({ reason: "abcdefghij" }).success, "exactly 10 characters");
+    // Real 10-character reasons containing a space are valid (audit H2).
+    for (const ok of ["Wrong item", "Late order", "Broken box", "  Wrong item  "]) {
+      assert.ok(refund({ reason: ok }).success, JSON.stringify(ok));
+    }
     const r = refund({ reason: "   Product defective   " });
     assert.ok(r.success);
     assert.equal(r.data.reason, "Product defective", "surrounding whitespace is trimmed");
@@ -232,12 +235,18 @@ describe("Task 1 — MCP server over stdio (JSON-RPC)", () => {
   });
 
   test("empty refund reason → -32602", async () => {
-    expectInvalidParams(await refund({ reason: "" }), "reason", /10 non-whitespace/);
+    expectInvalidParams(await refund({ reason: "" }), "reason", /at least 10 characters/);
   });
 
-  test("reason containing only spaces → -32602", async () => {
-    expectInvalidParams(await refund({ reason: "               " }), "reason", /10 non-whitespace/);
-    expectInvalidParams(await refund({ reason: "a         b" }), "reason", /10 non-whitespace/);
+  test("reason containing only spaces (or padding around a short reason) → -32602", async () => {
+    expectInvalidParams(await refund({ reason: "               " }), "reason", /at least 10 characters/);
+    expectInvalidParams(await refund({ reason: "   short   " }), "reason", /at least 10 characters/);
+  });
+
+  test("a 10-character reason with an inner space is accepted over stdio (audit H2)", async () => {
+    const r = await refund({ reason: "Wrong item" });
+    assert.equal(r.error, undefined, JSON.stringify(r.error));
+    assert.equal(JSON.parse(r.result.content[0].text).reason, "Wrong item");
   });
 
   test("missing required fields → -32602 naming every missing field", async () => {

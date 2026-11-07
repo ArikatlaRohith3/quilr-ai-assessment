@@ -60,6 +60,25 @@ export function createRouterApp(opts: RouterAppOptions) {
 
   const fail = (res: Response, status: number, message: string) => res.status(status).json(gatewayError(status, message, SOURCE));
 
+  /** Gives a reservation back; a storage error here is logged, never thrown (the request is already failing). */
+  const safeRelease = (id: number, requestId: string) => {
+    try {
+      limiter.release(id);
+    } catch (err) {
+      log.error("failed to release reservation", { requestId, error: String(err) });
+    }
+  };
+
+  /**
+   * Express 4 does not catch errors thrown by async handlers: they become unhandled
+   * rejections, which terminate the Node process. Route them to the error middleware instead.
+   */
+  const asyncRoute =
+    (handler: (req: Request, res: Response) => Promise<unknown>) =>
+    (req: Request, res: Response, next: NextFunction) => {
+      handler(req, res).catch(next);
+    };
+
   app.get("/health", (_req, res) => res.json({ status: "ok", service: "rate-limiter", tokenizer: tokenizer.name }));
 
   app.get("/metrics", (req, res) => {
@@ -76,7 +95,7 @@ export function createRouterApp(opts: RouterAppOptions) {
     });
   });
 
-  app.post("/v1/chat/completions", async (req: Request, res: Response) => {
+  app.post("/v1/chat/completions", asyncRoute(async (req: Request, res: Response) => {
     const requestId = randomUUID();
     res.setHeader("X-Request-ID", requestId);
 
@@ -109,7 +128,17 @@ export function createRouterApp(opts: RouterAppOptions) {
     if (estimate.total > limiter.limit) {
       return fail(res, 400, `Request needs ~${estimate.total} tokens, more than the ${limiter.limit} tokens/min budget`);
     }
-    const reservation = limiter.reserve(tenantId, estimate.total);
+    // Fail closed: if the budget store is unavailable (e.g. SQLITE_BUSY after busy_timeout,
+    // disk or permission errors) the request is refused cleanly — never served unaccounted,
+    // and never allowed to crash the process for every other tenant.
+    let reservation: ReturnType<RateLimiter["reserve"]>;
+    try {
+      reservation = limiter.reserve(tenantId, estimate.total);
+    } catch (err) {
+      log.error("rate limiter unavailable", { requestId, tenant: tenantId, error: String(err) });
+      res.setHeader("Retry-After", "1");
+      return fail(res, 503, "Rate limiter temporarily unavailable");
+    }
     res.setHeader("X-RateLimit-Limit", String(limiter.limit));
     if (!reservation.ok) {
       log.info("rate limited", { requestId, tenant: tenantId, used: reservation.used, requested: estimate.total });
@@ -123,7 +152,7 @@ export function createRouterApp(opts: RouterAppOptions) {
     try {
       result = await router.complete(request, requestId);
     } catch (err) {
-      limiter.release(reservation.id);
+      safeRelease(reservation.id, requestId);
       log.error("router crashed", { requestId, error: String(err) });
       return fail(res, 500, "Internal gateway error");
     }
@@ -133,7 +162,7 @@ export function createRouterApp(opts: RouterAppOptions) {
 
     if (outcome.kind !== "ok") {
       // Nothing was delivered, so the tenant isn't charged for it.
-      limiter.release(reservation.id);
+      safeRelease(reservation.id, requestId);
       if (outcome.kind === "rejected") return fail(res, 400, "Upstream provider rejected the request");
       if (outcome.kind === "timeout") return fail(res, 504, "All providers timed out");
       if (outcome.kind === "rate_limited") {
@@ -146,8 +175,15 @@ export function createRouterApp(opts: RouterAppOptions) {
     // 5. Reconcile the reservation with real usage (or keep the estimate if none was reported).
     const r = outcome.response;
     const actual = r.usage ? r.usage.input_tokens + r.usage.output_tokens : estimate.total;
-    limiter.commit(reservation.id, actual);
-    res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limiter.limit - limiter.usage(tenantId))));
+    // The provider already answered (and was paid for), so a bookkeeping failure must not
+    // throw the answer away. The reservation then simply stays at the estimate until it
+    // ages out of the window — the conservative outcome for the budget.
+    try {
+      limiter.commit(reservation.id, actual);
+      res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limiter.limit - limiter.usage(tenantId))));
+    } catch (err) {
+      log.error("failed to reconcile reservation; keeping the estimate", { requestId, tenant: tenantId, error: String(err) });
+    }
     log.info("completed", {
       requestId, tenant: tenantId, provider: r.provider, fallback: result.usedFallback,
       estimated: estimate.total, actual, usage_reported: !!r.usage,
@@ -182,12 +218,14 @@ export function createRouterApp(opts: RouterAppOptions) {
       choices: [{ index: 0, message: { role: "assistant", content: r.content }, finish_reason: r.finish_reason }],
       usage,
     });
-  });
+  }));
 
   app.use((err: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
     if (err.type === "entity.parse.failed") return fail(res, 400, "Invalid JSON body");
     if (err.type === "entity.too.large") return fail(res, 413, "Request too large");
     log.error("unhandled error", { error: err.message });
+    // If a response was already being written, it can only be cut short — never re-headed.
+    if (res.headersSent) return void res.end();
     fail(res, 500, "Internal gateway error");
   });
 

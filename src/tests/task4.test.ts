@@ -449,3 +449,67 @@ describe("Integration — client → Task 3 guardrail → Task 4 router → prov
     } finally { await c.close(); }
   });
 });
+
+// ─────────────── audit fix H1: storage errors never crash the router ───────────────
+
+describe("Task 4 — rate-limiter storage failures (audit H1)", () => {
+  async function appWith(limiter: RateLimiter) {
+    const primary = await mockOpenAI();
+    const secondary = await mockAnthropic();
+    const app = createRouterApp({
+      limiter,
+      router: new Router(new OpenAIAdapter({ baseUrl: primary.url, apiKey: PRIMARY_KEY, defaultModel: "gpt-test" }), new AnthropicAdapter({ baseURL: secondary.url, apiKey: SECONDARY_KEY, model: "claude-opus-5-5" }), { timeoutMs: 2000, maxJitterMs: 0 }),
+      tenants: new TenantRegistry([{ tenantId: "tenant-a", apiKey: KEY_A }]),
+      tokenizer: heuristicTokenizer,
+      defaultOutputReservation: 16,
+    });
+    const running = await serve(app);
+    return { running, primary, close: async () => { await running.close(); await primary.close(); await secondary.close(); } };
+  }
+  const body = { messages: [{ role: "user", content: "hi" }] };
+
+  test("an unavailable database → 503 + Retry-After, nothing sent to a provider, and the process keeps serving", async () => {
+    const db = openDatabase(":memory:");
+    const limiter = new RateLimiter(db, { limit: 50_000, windowMs: 60_000 });
+    db.close(); // stands in for SQLITE_BUSY after busy_timeout, disk-full, permission errors…
+    const h = await appWith(limiter);
+    try {
+      const { logs, result } = await captureLogs(async () => [await post(h.running.url, body), await post(h.running.url, body)]);
+      for (const r of result) {
+        assert.equal(r.status, 503);
+        assert.equal(r.headers.get("retry-after"), "1");
+        assert.deepEqual(r.body, { error: { code: 503, message: "Rate limiter temporarily unavailable", source: "llm-gateway" } });
+      }
+      assert.equal(h.primary.requests.length, 0, "fail closed: never served without accounting");
+      assert.match(logs, /rate limiter unavailable/);
+      assert.equal((await fetch(`${h.running.url}/health`)).status, 200, "the server is still up");
+    } finally { await h.close(); }
+  });
+
+  test("if reconciliation fails after the provider answered, the answer is still delivered", async () => {
+    class CommitFails extends RateLimiter {
+      override commit(): void { throw new Error("disk I/O error"); }
+    }
+    const h = await appWith(new CommitFails(openDatabase(":memory:"), { limit: 50_000, windowMs: 60_000 }));
+    try {
+      const { logs, result: r } = await captureLogs(() => post(h.running.url, body));
+      assert.equal(r.status, 200);
+      assert.equal(r.body.choices[0].message.content, "Hello from primary");
+      assert.match(logs, /failed to reconcile reservation/);
+    } finally { await h.close(); }
+  });
+
+  test("an unexpected error inside the handler becomes a sanitized 500 instead of an unhandled rejection", async () => {
+    const limiter = new RateLimiter(openDatabase(":memory:"), { limit: 50_000, windowMs: 60_000 });
+    const h = await appWith(limiter);
+    const original = limiter.reserve.bind(limiter);
+    // Simulate a programming bug outside any try/catch: reading the reservation result throws.
+    limiter.reserve = (...args) => { const r = original(...args); Object.defineProperty(r, "ok", { get() { throw new Error("internal bug at /srv/x.js"); } }); return r; };
+    try {
+      const { result: r } = await captureLogs(() => post(h.running.url, body));
+      assert.equal(r.status, 500);
+      assert.deepEqual(r.body, { error: { code: 500, message: "Internal gateway error", source: "llm-gateway" } });
+      assert.equal((await fetch(`${h.running.url}/health`)).status, 200, "the server is still up");
+    } finally { await h.close(); }
+  });
+});
