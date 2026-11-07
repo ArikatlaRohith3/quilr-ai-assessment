@@ -490,7 +490,7 @@ X-RateLimit-Remaining: 1982
 
 # larger than the whole budget
 HTTP/1.1 400 Bad Request
-{"error":{"code":400,"message":"Request needs ~5009 tokens, more than the 2000 tokens/min budget","source":"llm-gateway"}}
+{"error":{"code":400,"message":"Request needs ~5008 tokens, more than the 2000 tokens/min budget","source":"llm-gateway"}}
 
 # primary returns 429 → Claude fallback
 HTTP/1.1 200 OK
