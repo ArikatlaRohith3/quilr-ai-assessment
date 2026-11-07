@@ -1,11 +1,13 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { createGatewayApp } from "../task2-mcp-gateway/index.js";
 import { createMockDownstream } from "../task2-mcp-gateway/mock-downstream/index.js";
-import { HttpDownstream, StdioDownstream } from "../task2-mcp-gateway/proxy.js";
+import { HttpDownstream, StdioDownstream, DownstreamError, DownstreamTimeoutError, MAX_RESPONSE_BYTES } from "../task2-mcp-gateway/proxy.js";
 import { signToken, verifyToken, AuthError, type AuthConfig } from "../task2-mcp-gateway/auth.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -92,7 +94,10 @@ describe("Task 2 — gateway with HTTP downstream", () => {
 
   test("viewer may call non-admin tools and list tools", async () => {
     assert.equal((await rpc(gw.url, call(2, "get_data", {}), viewer)).body.result.content[0].text, "Executed tool: get_data");
-    assert.equal((await rpc(gw.url, { jsonrpc: "2.0", id: 3, method: "tools/list" }, viewer)).body.result.tools.length, 3);
+    // Viewers only see what they may call (audit M1); admins see everything.
+    const names = (r: any) => r.body.result.tools.map((t: any) => t.name).sort();
+    assert.deepEqual(names(await rpc(gw.url, { jsonrpc: "2.0", id: 3, method: "tools/list" }, viewer)), ["get_data"]);
+    assert.deepEqual(names(await rpc(gw.url, { jsonrpc: "2.0", id: 4, method: "tools/list" }, admin)), ["admin_purge_cache", "admin_reset_key", "get_data"]);
   });
 
   test("missing token → 401 -32000 with the request id preserved", async () => {
@@ -279,7 +284,7 @@ describe("Task 2 — MCP Streamable HTTP compliance (audit H1)", () => {
     const client = await sdkClient(gw.url, viewer);
     try {
       assert.deepEqual(client.getServerVersion(), { name: "quilr-mcp-gateway", version: "2.1.0" });
-      assert.equal((await client.listTools()).tools.length, 3);
+      assert.deepEqual((await client.listTools()).tools.map((t) => t.name), ["get_data"], "admin tools are hidden from viewers");
       const r = await client.callTool({ name: "get_data", arguments: {} });
       assert.equal((r.content as any)[0].text, "Executed tool: get_data");
     } finally {
@@ -316,12 +321,133 @@ describe("Task 2 — MCP Streamable HTTP compliance (audit H1)", () => {
       await assert.rejects(client.callTool({ name: "get_customer_record", arguments: { customer_id: "INVALID" } }), (err: unknown) => {
         assert.ok(err instanceof McpError);
         assert.equal(err.code, -32602);
+        // Task 1's structured validation details survive the gateway (audit M2).
+        assert.deepEqual((err.data as any)?.issues?.map((i: any) => i.field), ["customer_id"]);
         return true;
       });
     } finally {
       await client.close();
       await bridged.close();
       await downstream.close();
+    }
+  });
+});
+
+// ─────────────── audit fixes M4 / M8 / M11: downstream robustness ───────────────
+
+/** A fake MCP stdio server. Each spawn bumps a counter file; `behaviour(gen)` decides how that generation acts. */
+function fakeServer(dir: string, body: string): string {
+  const file = path.join(dir, "fake-mcp.mjs");
+  fs.writeFileSync(file, `
+import fs from "node:fs";
+const dir = ${JSON.stringify(dir)};
+const counter = dir + "/spawns";
+const gen = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, "utf8")) : 0) + 1;
+fs.writeFileSync(counter, String(gen));
+const NL = String.fromCharCode(10);
+const out = (m) => process.stdout.write(JSON.stringify(m) + NL);
+let buf = "";
+process.stdin.on("data", (c) => {
+  buf += c; let i;
+  while ((i = buf.indexOf(NL)) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    const m = JSON.parse(line);
+    fs.appendFileSync(dir + "/received", gen + " " + m.method + (m.params?.requestId ? " " + m.params.requestId : "") + NL);
+    if (m.method === "initialize") { out({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } }); continue; }
+    if (m.id === undefined) continue;
+    ${body}
+  }
+});
+`);
+  return file;
+}
+
+describe("Task 2 — downstream robustness (audit M4, M8, M11)", () => {
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "quilr-gw-"));
+  const list = { jsonrpc: "2.0" as const, id: 1, method: "tools/list", params: {} };
+
+  test("a hung downstream is cancelled, then killed and replaced after repeated timeouts", async () => {
+    const dir = tmp();
+    // Generation 1 never answers tools/list; later generations answer normally.
+    const script = fakeServer(dir, `if (gen > 1) out({ jsonrpc: "2.0", id: m.id, result: { tools: [{ name: "gen" + gen, inputSchema: { type: "object" } }] } });`);
+    const d = new StdioDownstream(process.execPath, [script], 300, { maxConsecutiveTimeouts: 2 });
+    try {
+      await assert.rejects(d.send(list), DownstreamTimeoutError);
+      await assert.rejects(d.send(list), DownstreamTimeoutError);
+      const r = await d.send(list);
+      assert.deepEqual((r.result as any).tools.map((t: any) => t.name), ["gen2"], "a fresh process serves the next request");
+      assert.equal(d.spawnCount, 2);
+      const received = fs.readFileSync(path.join(dir, "received"), "utf8");
+      assert.match(received, /^1 notifications\/cancelled gw-\d+$/m, "the timed-out request was cancelled (MCP notifications/cancelled)");
+    } finally {
+      await d.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a crash-looping downstream backs off instead of respawning on every request", async () => {
+    const dir = tmp();
+    const script = path.join(dir, "crash.mjs");
+    fs.writeFileSync(script, "process.exit(1);");
+    const d = new StdioDownstream(process.execPath, [script], 1000, { initialBackoffMs: 200, maxBackoffMs: 1000 });
+    try {
+      const started = Date.now();
+      let fastFails = 0;
+      while (Date.now() - started < 1200) {
+        await d.send(list).catch((e) => { assert.ok(e instanceof DownstreamError); if (/backoff/.test(e.message)) fastFails++; });
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(fastFails > 10, `requests fail fast while backing off (${fastFails})`);
+      assert.ok(d.spawnCount <= 5, `spawned ${d.spawnCount} processes in 1.2 s (exponential backoff)`);
+    } finally {
+      await d.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("HTTP downstream: a body that stalls after the headers → timeout (-32003), not 502", async () => {
+    const stall = express().post("/", (_q, s) => { s.writeHead(200, { "Content-Type": "application/json" }); s.write('{"jsonrpc":"2.0",'); });
+    const up = await serve(stall);
+    const gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(up.url, 300) }));
+    try {
+      const r = await rpc(gw.url, call(1, "get_data", {}), viewer);
+      assert.deepEqual(r.body.error, { code: -32003, message: "Downstream MCP server timed out" });
+    } finally {
+      await gw.close();
+      await up.close();
+    }
+  });
+
+  test("HTTP downstream: oversized responses are refused (-32002) without buffering them", async () => {
+    const big = "x".repeat(MAX_RESPONSE_BYTES + 10);
+    const huge = express().post("/", (_q, s) => {
+      s.writeHead(200, { "Content-Type": "application/json" });
+      s.end(`{"jsonrpc":"2.0","id":1,"result":{"pad":"${big}"}}`);
+    });
+    const up = await serve(huge);
+    const gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(up.url, 3000) }));
+    try {
+      const r = await rpc(gw.url, call(1, "get_data", {}), viewer);
+      assert.deepEqual(r.body.error, { code: -32002, message: "Downstream MCP server unavailable" });
+    } finally {
+      await gw.close();
+      await up.close();
+    }
+  });
+
+  test("small error.data passes through; oversized error.data is dropped", async () => {
+    const withData = (data: unknown) => express().post("/", (q, s) => s.json({ jsonrpc: "2.0", id: q.body?.id ?? 1, error: { code: -32602, message: "bad", data } }));
+    for (const [data, expected] of [[{ issues: [{ field: "x", message: "y" }] }, true], [{ blob: "z".repeat(20_000) }, false]] as const) {
+      const up = await serve(express().use(express.json()).use(withData(data)));
+      const gw = await serve(createGatewayApp({ auth, downstream: new HttpDownstream(up.url, 2000) }));
+      try {
+        const r = await rpc(gw.url, call(7, "get_data", {}), viewer);
+        assert.equal(r.body.id, 7);
+        assert.equal("data" in r.body.error, expected);
+      } finally {
+        await gw.close();
+        await up.close();
+      }
     }
   });
 });

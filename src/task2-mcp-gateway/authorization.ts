@@ -34,6 +34,21 @@ export function authorizeToolCall(principal: Principal, toolName: string, cfg: P
   return { allowed: true, reason: "policy allows" };
 }
 
+/**
+ * Removes tools the caller may not call from a tools/list response, so a viewer
+ * doesn't even learn the names of admin tools. Uses the same rule as
+ * authorizeToolCall; anything that isn't a well-formed tool list passes through.
+ */
+export function filterToolsForRole<T extends { result?: unknown }>(response: T, principal: Principal, cfg: PolicyConfig = {}): T {
+  const result = response.result as { tools?: unknown } | undefined;
+  if (!result || !Array.isArray(result.tools)) return response;
+  const tools = result.tools.filter((t) => {
+    const name = (t as { name?: unknown } | null)?.name;
+    return typeof name === "string" && authorizeToolCall(principal, name, cfg).allowed;
+  });
+  return { ...response, result: { ...result, tools } };
+}
+
 export function policyFromEnv(): PolicyConfig {
   return {
     adminOnlyTools: (process.env.ADMIN_ONLY_TOOLS ?? "")

@@ -15,6 +15,8 @@ import { OpenAIAdapter } from "../task4-rate-limiter/providers/openai.js";
 import { AnthropicAdapter } from "../task4-rate-limiter/providers/anthropic.js";
 import { mockOpenAI, mockAnthropic, type MockLlm } from "../shared/mock-providers.js";
 import { serve, captureLogs, type Running } from "./helpers.js";
+import { createGuardrailApp } from "../task3-llm-guardrail/index.js";
+import { ApiKeyRegistry } from "../shared/api-keys.js";
 
 const KEY_A = "tenant-a-key-0123456789";
 const KEY_B = "tenant-b-key-0123456789";
@@ -266,9 +268,21 @@ describe("Task 4 — failover", () => {
     }
   });
 
-  test("streaming requests are rejected clearly", async () => {
-    const r = await post(h.url, { stream: true, messages: [{ role: "user", content: "hi" }] });
-    assert.equal(r.status, 400);
+  test("stream: true returns the answer in OpenAI streaming format (audit M5)", async () => {
+    reset();
+    const res = await fetch(`${h.url}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${KEY_A}` },
+      body: JSON.stringify({ stream: true, max_tokens: 32, messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /text\/event-stream/);
+    const events = (await res.text()).split("\n\n").filter(Boolean).map((e) => e.replace(/^data: /, ""));
+    assert.equal(events.at(-1), "[DONE]");
+    const chunks = events.slice(0, -1).map((e) => JSON.parse(e));
+    assert.equal(chunks.map((c) => c.choices[0].delta.content ?? "").join(""), "Hello from primary");
+    assert.equal(chunks.at(-1).choices[0].finish_reason, "stop");
+    assert.deepEqual(chunks.at(-1).usage, { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18, estimated: false });
   });
 });
 
@@ -359,5 +373,79 @@ describe("Task 4 — output is capped by the reservation (audit H2)", () => {
         assert.throws(() => createRouterApp({ limiter: h.limiter, router: null as any, tenants: new TenantRegistry([]), tokenizer: heuristicTokenizer, defaultOutputReservation: bad }), /defaultOutputReservation/, String(bad));
       }
     } finally { await h.close(); }
+  });
+});
+
+// ─────────────── audit fixes M5 / M6 ───────────────
+
+describe("Task 4 — model allowlist (audit M6)", () => {
+  test("only allowlisted models may be requested; omitting the model uses the default", async () => {
+    const primary = await mockOpenAI();
+    const secondary = await mockAnthropic();
+    const limiter = new RateLimiter(openDatabase(":memory:"), { limit: 50_000, windowMs: 60_000 });
+    const app = createRouterApp({
+      limiter,
+      router: new Router(new OpenAIAdapter({ baseUrl: primary.url, apiKey: PRIMARY_KEY, defaultModel: "gpt-4o-mini" }), new AnthropicAdapter({ baseURL: secondary.url, apiKey: SECONDARY_KEY, model: "claude-opus-5-5" }), { timeoutMs: 2000, maxJitterMs: 0 }),
+      tenants: new TenantRegistry([{ tenantId: "tenant-a", apiKey: KEY_A }]),
+      tokenizer: heuristicTokenizer,
+      defaultOutputReservation: 16,
+      allowedModels: ["gpt-4o-mini"],
+    });
+    const running = await serve(app);
+    try {
+      const msg = { messages: [{ role: "user", content: "hi" }] };
+      const denied = await post(running.url, { ...msg, model: "gpt-5-pro-expensive" });
+      assert.equal(denied.status, 400);
+      assert.equal(denied.body.error.message, "Model not allowed: gpt-5-pro-expensive");
+      assert.equal(primary.requests.length, 0, "a denied model never reaches a provider");
+      assert.equal(limiter.usage("tenant-a"), 0, "and costs the tenant nothing");
+      assert.equal((await post(running.url, { ...msg, model: "gpt-4o-mini" })).status, 200);
+      assert.equal((await post(running.url, msg)).status, 200);
+      assert.equal(primary.requests[1].body.model, "gpt-4o-mini");
+    } finally {
+      await running.close(); await primary.close(); await secondary.close();
+    }
+  });
+});
+
+describe("Integration — client → Task 3 guardrail → Task 4 router → provider (audit M5)", () => {
+  const GUARDRAIL_KEY = "guardrail-client-key-0123456789";
+
+  async function chain(limit: number) {
+    const h = await harness({ limit, defaultOutputReservation: 64 });
+    // The guardrail authenticates to the router with a tenant key, exactly like any other tenant.
+    const g = await serve(createGuardrailApp({ upstreamBaseUrl: h.url, apiKey: KEY_A, clients: new ApiKeyRegistry([{ id: "app", apiKey: GUARDRAIL_KEY }]) }));
+    const ask = (content: string) => fetch(`${g.url}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${GUARDRAIL_KEY}` },
+      body: JSON.stringify({ messages: [{ role: "user", content }] }),
+    });
+    return { h, ask, close: async () => { await g.close(); await h.close(); } };
+  }
+
+  test("PII is redacted in both directions and the request is rate-limited and served", async () => {
+    const c = await chain(50_000);
+    try {
+      c.h.primary.options = { content: "Sure, I emailed jane.doe@example.com and noted SSN 123-45-6789." };
+      const res = await c.ask("My card is 4111 1111 1111 1111");
+      assert.equal(res.status, 200);
+      const raw = await res.text();
+      const text = raw.split("\n\n").filter((e) => e.startsWith("data: {")).map((e) => JSON.parse(e.slice(6)).choices?.[0]?.delta?.content ?? "").join("");
+      assert.equal(text, "Sure, I emailed [REDACTED] and noted SSN [REDACTED].");
+      assert.ok(raw.trimEnd().endsWith("data: [DONE]"));
+      // Inbound redaction happened before the router (and therefore the provider) saw the prompt.
+      assert.equal(c.h.primary.requests[0].body.messages[0].content, "My card is [REDACTED]");
+      assert.ok(c.h.limiter.usage("tenant-a") > 0, "the router charged the tenant");
+    } finally { await c.close(); }
+  });
+
+  test("the router's 429 reaches the client through the guardrail, sanitized", async () => {
+    const c = await chain(100);
+    try {
+      assert.equal((await c.ask("x".repeat(80))).status, 200);
+      const blocked = await c.ask("x".repeat(80));
+      assert.equal(blocked.status, 429);
+      assert.deepEqual(await blocked.json(), { error: { code: 429, message: "Upstream rate limit exceeded", source: "llm-guardrail" } });
+    } finally { await c.close(); }
   });
 });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AuthError, authConfigFromEnv, extractBearer, verifyToken, type AuthConfig, type Principal } from "./auth.js";
-import { ALLOWED_METHODS, TOOL_NAME_PATTERN, authorizeToolCall, policyFromEnv, type PolicyConfig } from "./authorization.js";
+import { ALLOWED_METHODS, TOOL_NAME_PATTERN, authorizeToolCall, filterToolsForRole, policyFromEnv, type PolicyConfig } from "./authorization.js";
 import { DownstreamTimeoutError, HttpDownstream, StdioDownstream, type Downstream, type JsonRpcRequest } from "./proxy.js";
 import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import { JSONRPC, jsonRpcError, safeJsonRpcId, type JsonRpcId } from "../shared/errors.js";
@@ -157,7 +157,9 @@ export function createGatewayApp({ auth, downstream, policy = {} }: GatewayOptio
     const forward: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
     const started = Date.now();
     try {
-      const response = await downstream.send(forward, { requestId });
+      let response = await downstream.send(forward, { requestId });
+      // Callers only see the tools they are allowed to call.
+      if (method === "tools/list") response = filterToolsForRole(response, principal, policy);
       audit({
         requestId, ...who, method, tool, decision: "allowed", reason: "policy allows",
         downstream_ms: Date.now() - started, outcome: response.error ? `error ${response.error.code}` : "ok",

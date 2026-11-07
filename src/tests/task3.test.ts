@@ -12,10 +12,10 @@ const CLIENT_KEY = "guardrail-client-key-0123456789";
 const CLIENTS = new ApiKeyRegistry([{ id: "test-app", apiKey: CLIENT_KEY }]);
 const CLIENT_HEADERS = { "Content-Type": "application/json", Authorization: `Bearer ${CLIENT_KEY}` };
 
-const PII = ["jane.doe@example.com", "123-45-6789", "4111 1111 1111 1111", "4111-1111-1111-1111", "4111111111111111", "(555) 867-5309", "+1 555 867 5309", "555.867.5309", "+447911123456"];
+const PII = ["jane.doe@example.com", "123-45-6789", "4111 1111 1111 1111", "4111-1111-1111-1111", "4111111111111111", "(555) 867-5309", "+1 555 867 5309", "555.867.5309", "+447911123456", "+44 7911 123456", "+91 98765-43210", "123 45 6789"];
 
 /** Things that must never appear in output (sub-fragments that would still identify the value). */
-const LEAK_MARKERS = ["jane.doe", "example.com", "45-6789", "1111 1111", "1111-1111", "41111111", "867-5309", "867 5309", "867.5309", "7911123456"];
+const LEAK_MARKERS = ["jane.doe", "example.com", "45-6789", "1111 1111", "1111-1111", "41111111", "867-5309", "867 5309", "867.5309", "7911123456", "7911 1234", "98765-4321", "45 6789"];
 const assertNoLeak = (out: string) => {
   for (const m of LEAK_MARKERS) assert.ok(!out.includes(m), `leaked "${m}" in: ${out}`);
 };

@@ -14,6 +14,10 @@ export const PII_PATTERNS: ReadonlyArray<{ name: string; regex: RegExp }> = [
   { name: "phone", regex: /(?<![\w+])(?:\+?1[-.\s]?)?(?:\(\d{3}\)|\d{3})[-.\s]?\d{3}[-.\s]?\d{4}(?!\w)/g },
   // Compact international E.164: +447911123456
   { name: "phone_e164", regex: /(?<![\w+])\+[1-9]\d{7,14}(?!\w)/g },
+  // International with separators: +44 7911 123456, +91 98765-43210, +33 1.23.45.67.89 (8–15 digits after "+")
+  { name: "phone_intl", regex: /(?<![\w+])\+[1-9](?:[ .-]?\d){7,14}(?!\w)/g },
+  // SSN written with spaces: 123 45 6789
+  { name: "ssn_spaced", regex: /\b\d{3} \d{2} \d{4}\b/g },
 ];
 
 export function redactWithCount(text: string): { text: string; count: number } {

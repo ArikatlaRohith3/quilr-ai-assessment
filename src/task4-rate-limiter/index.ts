@@ -38,6 +38,8 @@ export interface RouterAppOptions {
   defaultOutputReservation: number;
   /** Bearer token for GET /metrics. When unset, /metrics is disabled. */
   metricsToken?: string;
+  /** Models a client may request. Omitted/empty = any. Requests without a model use the provider default. */
+  allowedModels?: string[];
 }
 
 const safeEqual = (a: string, b: string) => {
@@ -88,7 +90,11 @@ export function createRouterApp(opts: RouterAppOptions) {
     // 2. Validate and normalise the request.
     const parsed = ChatRequest.safeParse(req.body);
     if (!parsed.success) return fail(res, 400, `Invalid request: ${parsed.error.issues[0]?.path.join(".") || "body"} ${parsed.error.issues[0]?.message ?? ""}`.trim());
-    if (parsed.data.stream) return fail(res, 400, "Streaming is not supported by this endpoint");
+    const allowed = opts.allowedModels ?? [];
+    if (parsed.data.model !== undefined && allowed.length > 0 && !allowed.includes(parsed.data.model)) {
+      return fail(res, 400, `Model not allowed: ${parsed.data.model}`);
+    }
+    const wantsStream = parsed.data.stream === true;
     const request: NormalizedRequest = {
       model: parsed.data.model,
       messages: parsed.data.messages,
@@ -147,16 +153,34 @@ export function createRouterApp(opts: RouterAppOptions) {
       estimated: estimate.total, actual, usage_reported: !!r.usage,
     });
 
+    const id = `chatcmpl-${requestId}`;
+    const created = Math.floor(Date.now() / 1000);
+    const usage = r.usage
+      ? { prompt_tokens: r.usage.input_tokens, completion_tokens: r.usage.output_tokens, total_tokens: actual, estimated: false }
+      : { prompt_tokens: estimate.input, completion_tokens: estimate.output, total_tokens: estimate.total, estimated: true };
+
+    if (wantsStream) {
+      // Providers are called non-streaming (so failover and the token budget stay exact); the
+      // finished answer is delivered in the OpenAI streaming format, so streaming clients —
+      // including the Task 3 guardrail — can sit in front of this router.
+      const base = { id, object: "chat.completion.chunk", created, model: r.model, provider: r.provider };
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache");
+      res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: r.content }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: r.finish_reason }], usage })}\n\n`);
+      res.end("data: [DONE]\n\n");
+      return;
+    }
+
     res.json({
-      id: `chatcmpl-${requestId}`,
+      id,
       object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
+      created,
       model: r.model,
       provider: r.provider,
       choices: [{ index: 0, message: { role: "assistant", content: r.content }, finish_reason: r.finish_reason }],
-      usage: r.usage
-        ? { prompt_tokens: r.usage.input_tokens, completion_tokens: r.usage.output_tokens, total_tokens: actual, estimated: false }
-        : { prompt_tokens: estimate.input, completion_tokens: estimate.output, total_tokens: estimate.total, estimated: true },
+      usage,
     });
   });
 
@@ -197,6 +221,8 @@ async function main() {
     limiter, tenants, router, tokenizer,
     defaultOutputReservation: intFromEnv("DEFAULT_OUTPUT_RESERVATION", 1024),
     metricsToken: process.env.METRICS_TOKEN || undefined,
+    // Default: only the configured primary model, so tenants can't pick an arbitrarily expensive one.
+    allowedModels: (process.env.ALLOWED_MODELS || process.env.PRIMARY_MODEL || "gpt-4o-mini").split(",").map((m) => m.trim()).filter(Boolean),
   });
   const port = intFromEnv("PORT", 3004);
   app.listen(port, () => log.info("Rate-limiting LLM router listening", { port, db: dbPath, tenants: tenants.size, tokenizer: tokenizer.name }));

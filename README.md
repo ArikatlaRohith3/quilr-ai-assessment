@@ -2,7 +2,7 @@
 
 > **TypeScript (strict)** · Node.js ≥ 22.13 · MCP SDK · Express · zod 4 · SQLite (`node:sqlite`) · Anthropic SDK
 
-Four modules covering an AI gateway stack: an MCP server, an MCP security gateway, a streaming PII guardrail, and a rate-limited LLM router with provider failover. Every behaviour described below is covered by an automated test (**110 tests**, `npm test`) and by the end-to-end demo (`npm run demo`, 21 checks). Neither needs API keys.
+Four modules covering an AI gateway stack: an MCP server, an MCP security gateway, a streaming PII guardrail, and a rate-limited LLM router with provider failover. Every behaviour described below is covered by an automated test (**118 tests**, `npm test`) and by the end-to-end demo (`npm run demo`, 21 checks). Neither needs API keys.
 
 > **Changes from v1.** Every design flagged in review has been replaced in the code, not only in the docs:
 >
@@ -43,7 +43,7 @@ Four modules covering an AI gateway stack: an MCP server, an MCP security gatewa
 
 ```bash
 npm install
-npm test                  # build + 110 tests (node:test)
+npm test                  # build + 118 tests (node:test)
 npm run demo              # in-process end-to-end demo, prints ✅/❌, exits non-zero on failure
 
 cp .env.example .env      # then fill in what you need (see below)
@@ -131,11 +131,19 @@ curl -s localhost:3002/ -H "Authorization: Bearer $TOKEN" -H "Content-Type: appl
 - **IDs are preserved.** Every response keeps the client's JSON-RPC `id`.
 - **Request IDs.** `X-Request-ID` is propagated downstream and echoed back. Values that aren't safe are replaced with a generated ID.
 - **One audit line per request.** It records the subject, role, method, tool, decision, status and latency. It never contains the token or the tool arguments.
+- **Least disclosure.** `tools/list` is filtered by role, using the same rule as the call check, so viewers never see admin tool names.
+- **Error details survive.** Small `error.data` from the downstream, such as Task 1's per-field validation `issues`, is passed through; anything over 8 KB is dropped.
 
 **Downstream.** By default the gateway spawns the Task 1 server and bridges HTTP to **stdio** (`StdioDownstream`):
 1. It performs the MCP `initialize` handshake.
 2. It rewrites request IDs to internal `gw-N` values, so concurrent clients reusing the same ID can't collide, then restores the original ID on the response.
-3. It applies per-request timeouts and restarts the child process if it exits.
+3. It applies per-request timeouts. A timed-out request is cancelled downstream with MCP `notifications/cancelled`.
+4. **Self-healing:**
+   - After 2 timeouts in a row the child is treated as hung, then killed and replaced.
+   - A child that crashes within 5 s of starting is restarted with exponential backoff (250 ms, doubling, up to 5 s). While it backs off, requests fail fast instead of spawning a process each time.
+   - A crashed child only fails its own in-flight requests, never those of its replacement.
+
+The HTTP downstream reads at most 1 MB per response. A body that stalls after the headers counts as a timeout (`-32003`).
 
 To use an HTTP MCP endpoint instead, set `DOWNSTREAM_URL`. For example, `npm run mock-downstream` serves one on :3010; it used to be on :3003, which clashed with Task 3.
 
@@ -155,9 +163,9 @@ The guardrail proxies OpenAI-compatible `/v1/chat/completions` and redacts PII i
 | Pattern | Example | Output |
 |---------|---------|--------|
 | Email | `jane.doe@example.com` | `[REDACTED]` |
-| SSN | `123-45-6789` | `[REDACTED]` |
+| SSN | `123-45-6789`, `123 45 6789` | `[REDACTED]` |
 | Credit card (13–19 digits, spaces/dashes) | `4111 1111 1111 1111` | `[REDACTED]` |
-| Phone (NANP and E.164) | `+1 (555) 867-5309`, `+447911123456` | `[REDACTED]` |
+| Phone (NANP, E.164, international with separators) | `+1 (555) 867-5309`, `+447911123456`, `+44 7911 123456`, `+91 98765-43210` | `[REDACTED]` |
 
 **SSE parsing.** An incremental WHATWG-style parser:
 - keeps partial frames across network reads
@@ -221,7 +229,15 @@ A rejected request gets HTTP 429 with an exact `Retry-After`, worked out from wh
 | 400 / 404 / 422 (bad request) | 400, no failover (the fallback would fail the same way) |
 | both rate limited / timeout / failed | 503 + `Retry-After` / 504 / 502 |
 
-Responses come back in a normalised `chat.completion` shape that includes `provider` and `usage.estimated`. Errors are always sanitised:
+Responses come back in a normalised `chat.completion` shape that includes `provider` and `usage.estimated`.
+
+- **Streaming clients.** With `"stream": true`, providers are still called non-streaming, so failover and token accounting stay exact. The finished answer is then delivered in OpenAI's streaming format (content chunk, finish chunk with `usage`, `[DONE]`). That lets the **Task 3 guardrail sit in front of the router**, using a tenant key as its `LLM_API_KEY`: client → guardrail → router → provider, all covered by an integration test.
+- **Model allowlist.** Tenants may only request models in `ALLOWED_MODELS`, which defaults to `PRIMARY_MODEL`, so nobody can switch the gateway onto an expensive model. A denied model gets 400 and costs nothing.
+- **Known limits:**
+  - `PROVIDER_TIMEOUT_MS` defaults to 3 s per provider, which suits short completions. Raise it for long answers, or both providers will time out (504).
+  - SQLite calls are synchronous, so heavy lock contention between several router processes briefly blocks each process (bounded by `busy_timeout`, 5 s).
+
+Errors are always sanitised:
 ```json
 { "error": { "code": 502, "message": "All providers failed", "source": "llm-gateway" } }
 ```
@@ -244,9 +260,9 @@ curl -s localhost:3004/v1/chat/completions -H "Authorization: Bearer $TENANT_KEY
 | Suite | Tests | Highlights |
 |-------|------:|------------|
 | `task1.test.ts` | 30 | Every validation case (valid/invalid ID, negative, zero, NaN, Infinity, empty or space-only reason, missing and unexpected fields, valid refund) as schema tests and over the real stdio server; the exact `-32602` response; `-32700`/`-32600`; stdout purity; startup failure → exit 1; stdin close → exit 0 |
-| `task2.test.ts` | 29 | Forged, `alg:none`, tampered, expired, wrong-aud/iss tokens; `ADMIN_` in any casing; invalid JSON-RPC; ID preservation; downstream timeouts and failures; audit logs with no secrets; stdio bridge to Task 1 with concurrent same-ID requests; **official MCP SDK client** connects, lists and calls tools, gets `McpError -32001` for blocked calls, and reaches Task 1 end to end; `initialize`, 202 notifications, 405 GET/DELETE |
+| `task2.test.ts` | 34 | Forged, `alg:none`, tampered, expired, wrong-aud/iss tokens; `ADMIN_` in any casing; invalid JSON-RPC; ID preservation; downstream timeouts and failures; audit logs with no secrets; stdio bridge to Task 1 with concurrent same-ID requests; **official MCP SDK client** connects, lists and calls tools, gets `McpError -32001` for blocked calls, and reaches Task 1 end to end; `initialize`, 202 notifications, 405 GET/DELETE; viewers see no admin tools; `error.data` passes through (and oversized data is dropped); hung downstream cancelled and replaced; crash loop backs off; stalled or oversized HTTP bodies |
 | `task3.test.ts` | 29 | SSE parser at every split point; redactor ≡ `redact(full)` at every split, char-by-char and under fuzz; byte-sliced end-to-end; single `[DONE]`; malformed frames; missing `[DONE]`; client disconnect cancels upstream; TTFT; no PII in logs; **client auth** (401, upstream never called, client key never forwarded); PII in **tool-call arguments, refusal and reasoning** split across frames; logprobs stripped; inbound tool-call history redacted |
-| `task4.test.ts` | 22 | Exact 429 + Retry-After; oversized → 400; 25 concurrent requests and 4 processes on one DB with no over-allocation; persistence across restarts; reconciliation; every failover path; Anthropic request translation; tenant isolation; `/metrics` auth; no keys in logs; **output capped at the reservation** on both providers, so an over-generating burst without `max_tokens` stays within the limit |
+| `task4.test.ts` | 25 | Exact 429 + Retry-After; oversized → 400; 25 concurrent requests and 4 processes on one DB with no over-allocation; persistence across restarts; reconciliation; every failover path; Anthropic request translation; tenant isolation; `/metrics` auth; no keys in logs; **output capped at the reservation** on both providers, so an over-generating burst without `max_tokens` stays within the limit; `stream: true` SSE output; model allowlist; **client → Task 3 → Task 4 → provider integration** (PII redacted both ways, 429 propagated) |
 
 ---
 
